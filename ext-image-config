@@ -1,0 +1,187 @@
+#!/bin/bash
+
+set -e
+
+echo "Select image visibility:"
+echo "1. Public"
+echo "2. Private"
+read -p "Enter choice [1-2]: " visibility_choice
+
+if [ "$visibility_choice" = "1" ]; then
+    echo "Fetching public images..."
+    image_json=$(openstack image list --long -f json --all | jq '[.[] | select(.Visibility=="public")]')
+elif [ "$visibility_choice" = "2" ]; then
+    echo "Fetching project list..."
+    projects=$(openstack project list -f value -c ID -c Name)
+    IFS=$'\n' read -d '' -r -a project_array <<< "$projects"
+
+    echo "Select a project:"
+    for i in "${!project_array[@]}"; do
+        pid=$(echo "${project_array[$i]}" | awk '{print $1}')
+        pname=$(echo "${project_array[$i]}" | cut -d' ' -f2-)
+        echo "$((i+1)). $pid ($pname)"
+    done
+
+    read -p "Enter project number: " project_index
+    project_index=$((project_index-1))
+
+    selected_project_line="${project_array[$project_index]}"
+    project_id=$(echo "$selected_project_line" | awk '{print $1}')
+    project_name=$(echo "$selected_project_line" | cut -d' ' -f2-)
+    echo "Selected project: $project_name"
+
+    image_json=$(openstack image list --project="$project_id" --long -f json)
+else
+    echo "Invalid choice"
+    exit 1
+fi
+
+count=$(echo "$image_json" | jq 'length')
+if [ "$count" -eq 0 ]; then
+    echo "No images found."
+    exit 1
+fi
+
+echo "Available images:"
+for i in $(seq 0 $((count - 1))); do
+    id=$(echo "$image_json" | jq -r ".[$i].ID")
+    name=$(echo "$image_json" | jq -r ".[$i].Name")
+    echo "$((i + 1)). ($id) $name"
+done
+
+read -p "Select image by number: " choice
+if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+    echo "❌ Invalid selection."
+    exit 1
+fi
+
+selected_index=$((choice - 1))
+selected_id=$(echo "$image_json" | jq -r ".[$selected_index].ID")
+selected_name=$(echo "$image_json" | jq -r ".[$selected_index].Name")
+
+echo "✅ You selected: ($selected_id) $selected_name"
+
+echo "Select boot mode:"
+echo "1. legacy"
+echo "2. UEFI"
+read -p "Enter option number: " boot_mode_option
+case $boot_mode_option in
+    1) boot_mode="legacy" ;;
+    2) boot_mode="UEFI" ;;
+    *) echo "Invalid option"; exit 1 ;;
+esac
+
+echo "Selected boot mode: $boot_mode"
+
+echo "Select disk type:"
+echo "1. sata"
+echo "2. scsi"
+echo "3. virtio"
+read -p "Enter option number: " disk_type_option
+case $disk_type_option in
+    1) disk_type="sata" ;;
+    2) disk_type="scsi" ;;
+    3) disk_type="virtio" ;;
+    *) echo "Invalid option"; exit 1 ;;
+esac
+
+echo "Selected disk driver: $disk_type"
+
+echo "Select network type:"
+echo "1. rtl8139"
+echo "2. e1000"
+echo "3. virtio"
+read -p "Enter option number: " network_type_option
+case $network_type_option in
+    1) network_type="rtl8139" ;;
+    2) network_type="e1000" ;;
+    3) network_type="virtio" ;;
+    *) echo "Invalid option"; exit 1 ;;
+esac
+
+echo "Selected network driver: $network_type"
+
+to_unset=(
+  hw_machine_type
+  hw_scsi_model
+  hw_video_model
+  hw_input_bus
+  os_secure_boot
+  hw_firmware_type
+  hw_disk_bus
+  hw_vif_model
+)
+
+echo "[INFO] Cleaning existing image properties…"
+# 讀取目前影像屬性 (回傳 JSON 物件)
+props_json=$(openstack image show "$selected_id" -f json | jq -r '.properties')
+
+for key in "${to_unset[@]}"; do
+    if echo "$props_json" | jq -e "has(\"$key\")" >/dev/null; then
+        echo "  • unset $key"
+        if [ "$key" = "os_secure_boot" ]; then
+            # 使用 glance v2 CLI 移除受保護屬性
+            export OS_IMAGE_API_VERSION=2
+            glance image-update "$selected_id" --remove-property os_secure_boot >/dev/null 2>&1 || true
+        else
+            openstack image unset --property "$key" "$selected_id" || true
+        fi
+    fi
+done
+echo "[INFO] Property cleanup done."
+
+# Set common image properties
+openstack image set --property hw_machine_type=q35 --property hw_video_model=vga "$selected_id"
+
+# Boot mode settings
+if [[ "$boot_mode" == "UEFI" ]]; then
+    echo "Setting UEFI mode on image..."
+    openstack image set \
+        --property hw_firmware_type=uefi \
+        --property os_secure_boot=optional \
+        --property hw_disk_bus=sata \
+        "$selected_id"
+elif [[ "$boot_mode" == "legacy" ]]; then
+    echo "Setting legacy mode on image..."
+    openstack image set --property hw_firmware_type=bios "$selected_id"
+fi
+
+# Disk type settings
+case $disk_type in
+    sata)
+        openstack image set \
+            --property hw_disk_bus=sata \
+            --property hw_input_bus=usb \
+            "$selected_id"
+        ;;
+    scsi)
+        openstack image set \
+            --property hw_disk_bus=scsi \
+            --property hw_scsi_model=virtio-scsi \
+            --property hw_input_bus=virtio \
+            "$selected_id"
+        ;;
+    virtio)
+        openstack image set \
+            --property hw_disk_bus=virtio \
+            --property hw_scsi_model=virtio-scsi \
+            --property hw_input_bus=virtio \
+            "$selected_id"
+        ;;
+esac
+
+# Network type
+openstack image set --property hw_vif_model="$network_type" "$selected_id"
+
+# Show result
+echo "✅ Image properties set:"
+openstack image show "$selected_id" -f json | jq '.properties | {
+  hw_machine_type,
+  hw_scsi_model,
+  hw_video_model,
+  hw_input_bus,
+  os_secure_boot,
+  hw_firmware_type,
+  hw_disk_bus,
+  hw_vif_model
+}'

@@ -1,0 +1,376 @@
+#!/bin/bash
+set -euo pipefail
+LOGFILE="/var/log/support-change-port-ip.log"
+
+#--------------------------------------------------
+# 共用函式
+#--------------------------------------------------
+error_exit() {
+    echo "Error: $1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: $1" >> "$LOGFILE"
+    exit 1
+}
+
+log_info() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') INFO: $1" >> "$LOGFILE"
+}
+
+validate_ip() {
+    local ip=$1
+    local stat=1
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        IFS='.' read -r -a iparr <<< "$ip"
+        [[ ${iparr[0]} -le 255 && ${iparr[1]} -le 255 && ${iparr[2]} -le 255 && ${iparr[3]} -le 255 ]] && stat=0
+    fi
+    return $stat
+}
+
+ip_to_int() {
+    local IFS=. i1 i2 i3 i4
+    read -r i1 i2 i3 i4 <<< "$1"
+    let "ip_int = (i1 << 24) + (i2 << 16) + (i3 << 8) + i4"
+    echo "$ip_int"
+}
+
+ip_in_range() {
+    local ip_int start_int end_int
+    ip_int=$(ip_to_int "$1")
+    start_int=$(ip_to_int "$2")
+    end_int=$(ip_to_int "$3")
+    [ "$ip_int" -ge "$start_int" ] && [ "$ip_int" -le "$end_int" ]
+}
+
+parse_ip_range() {
+    local entry
+    IFS=',' read -ra parts <<< "$1"
+    for entry in "${parts[@]}"; do
+        if [[ "$entry" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$entry"
+        elif [[ "$entry" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            start=${BASH_REMATCH[1]}
+            end=${BASH_REMATCH[2]}
+            start_int=$(ip_to_int "$start")
+            end_int=$(ip_to_int "$end")
+            for ((i=start_int; i<=end_int; i++)); do
+                printf "%d.%d.%d.%d\n" $(( (i>>24)&255 )) $(( (i>>16)&255 )) $(( (i>>8)&255 )) $(( i&255 ))
+            done
+        else
+            echo "Invalid input: $entry" >&2
+            return 1
+        fi
+    done
+}
+
+#--------------------------------------------------
+# Step 0: 專案清單
+#--------------------------------------------------
+echo "Fetching OpenStack projects..."
+log_info "Fetching OpenStack projects..."
+projects=$(openstack project list -f json) || error_exit "Failed to fetch projects."
+project_ids=($(echo "$projects" | jq -r '.[].ID'))
+project_names=($(echo "$projects" | jq -r '.[].Name'))
+
+[ ${#project_ids[@]} -eq 0 ] && error_exit "No projects found."
+
+echo "Available Projects:"
+visible_project_ids=()
+visible_project_names=()
+
+for i in "${!project_ids[@]}"; do
+    if [[ "${project_names[$i]}" != "service" ]]; then
+        index=$(( ${#visible_project_ids[@]} + 1 ))
+        echo "$index. ${project_names[$i]} (${project_ids[$i]})"
+        visible_project_ids+=("${project_ids[$i]}")
+        visible_project_names+=("${project_names[$i]}")
+    fi
+done
+
+[ ${#visible_project_ids[@]} -eq 0 ] && error_exit "No visible projects available."
+
+read -p "Select a project by number: " project_selection
+[[ "$project_selection" =~ ^[0-9]+$ ]] \
+  && [ "$project_selection" -ge 1 ] \
+  && [ "$project_selection" -le ${#visible_project_ids[@]} ] \
+  || error_exit "Invalid project selection."
+
+project_id=${visible_project_ids[$((project_selection - 1))]}
+project_name=${visible_project_names[$((project_selection - 1))]}
+log_info "Selected Project: $project_name ($project_id)"
+echo "Selected Project: $project_name ($project_id)"
+
+#--------------------------------------------------
+# Step 1: Network 清單（含 shared）
+#--------------------------------------------------
+echo "Fetching OpenStack networks for project $project_name and shared networks..."
+log_info "Fetching OpenStack networks for project $project_name and shared networks..."
+
+# 取得 project 網路（無標籤）
+project_networks=$(openstack network list --project "$project_id" -f json) \
+  || error_exit "Failed to fetch project networks."
+
+# 取得 shared 網路，額外註記 shared=true
+shared_networks=$(openstack network list --share -f json | \
+  jq 'map(. + {shared: true})') \
+  || error_exit "Failed to fetch shared networks."
+
+# 合併去重
+combined_networks=$(jq -s 'add | unique_by(.ID)' <(echo "$project_networks") <(echo "$shared_networks"))
+
+# 建立陣列
+network_ids=($(echo "$combined_networks" | jq -r '.[].ID'))
+network_names=($(echo "$combined_networks" | jq -r '.[].Name'))
+network_shared_flags=($(echo "$combined_networks" | jq -r 'map(if .shared then "true" else "false" end) | .[]'))
+
+# 顯示列表
+echo "Available Networks:"
+for i in "${!network_ids[@]}"; do
+    shared_tag=""
+    [[ "${network_shared_flags[$i]}" == "true" ]] && shared_tag=" [shared]"
+    echo "$((i + 1)). ${network_names[$i]} (${network_ids[$i]})${shared_tag}"
+done
+
+read -p "Select a network by number: " selection
+[[ "$selection" =~ ^[0-9]+$ ]] \
+  && [ "$selection" -ge 1 ] \
+  && [ "$selection" -le ${#network_ids[@]} ] \
+  || error_exit "Invalid network selection."
+
+network_id=${network_ids[$((selection - 1))]}
+network_name=${network_names[$((selection - 1))]}
+log_info "Selected Network: $network_name ($network_id)"
+echo "Selected Network: $network_name ($network_id)"
+
+#--------------------------------------------------
+# 顯示 Subnet DHCP Allocation Pool 範圍
+#--------------------------------------------------
+echo "Subnets and DHCP ranges:"
+network_json=$(openstack network show "$network_id" -f json) || error_exit "Failed to get network info."
+subnet_ids=($(echo "$network_json" | jq -r '.subnets[]'))
+
+subnet_list=()
+for sid in "${subnet_ids[@]}"; do
+    subnet_json=$(openstack subnet show "$sid" -f json)
+    name=$(echo "$subnet_json" | jq -r '.name')
+    alloc=$(echo "$subnet_json" | jq -r '.allocation_pools | map("\(.start)-\(.end)") | join(", ")')
+    echo "network IP allocation pools: $alloc, ($sid), $name"
+    subnet_list+=("$sid|$alloc")
+done
+
+#--------------------------------------------------
+# Step 2: Port 清單 + 建立 Port
+#--------------------------------------------------
+echo "Fetching OpenStack ports for $network_name..."
+log_info "Fetching OpenStack ports for $network_name..."
+
+echo "IP in used:"
+openstack port list --network ab2777f8-ec5c-46bf-9354-317b6e86d054 -f json \
+  | jq -r '.[]."Fixed IP Addresses"[]?.ip_address' \
+  | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n \
+  | nl -w1 -s'. '
+
+ports=$(openstack port list --project "$project_id" --network "$network_id" --long -f json) \
+  || error_exit "Failed to fetch ports."
+
+readarray -t port_info < <(
+  echo "$ports" | jq -r '
+    .[] |
+    [
+      .ID,
+      (.["Fixed IP Addresses"] | map(.ip_address) | join(",")),
+      ."Device Owner"
+    ] | @tsv'
+)
+
+port_ids=(); port_ips=(); port_owners=()
+for line in "${port_info[@]}"; do
+    IFS=$'\t' read -r pid pips powner <<< "$line"
+    port_ids+=("$pid")
+    port_ips+=("$pips")
+    port_owners+=("$powner")
+done
+
+echo "Allocated Ports for Project - $project_name:"
+for i in "${!port_ids[@]}"; do
+    echo "$((i + 1)). ${port_ips[$i]} (${port_owners[$i]})"
+done
+echo "$(( ${#port_ids[@]} + 1 )). Create a new port(s)"
+
+read -p "Select a port by number: " port_selection
+if [[ "$port_selection" =~ ^[0-9]+$ ]] && [ "$port_selection" -ge 1 ] && [ "$port_selection" -le $(( ${#port_ids[@]} + 1 )) ]; then
+    if [ "$port_selection" -eq $(( ${#port_ids[@]} + 1 )) ]; then
+        read -p "Enter IP range [IP-IP,IP]: " input_range
+
+        ip_list=()
+        while IFS= read -r ip; do
+            ip_list+=("$ip")
+        done < <(parse_ip_range "$input_range")
+
+        [ ${#ip_list[@]} -eq 0 ] && error_exit "No valid IPs parsed."
+
+        for ip in "${ip_list[@]}"; do
+            validate_ip "$ip" || error_exit "Invalid IP: $ip"
+
+            matched_subnet=""
+            for row in "${subnet_list[@]}"; do
+                IFS='|' read -r sid ranges <<< "$row"
+                IFS=',' read -ra range_arr <<< "$ranges"
+                for r in "${range_arr[@]}"; do
+                    start=${r%-*}
+                    end=${r#*-}
+                    if ip_in_range "$ip" "$start" "$end"; then
+                        matched_subnet="$sid"
+                        break 2
+                    fi
+                done
+            done
+
+            [ -z "$matched_subnet" ] && error_exit "IP $ip does not match any allocation pool."
+
+            log_info "Creating port with IP $ip in subnet $matched_subnet"
+            port_id=$(openstack port create \
+                "$ip" \
+                --project "$project_id" \
+                --network "$network_id" \
+                --fixed-ip subnet="$matched_subnet",ip-address="$ip" \
+                -f value -c id) || error_exit "Failed to create port for $ip"
+
+            echo "✅ Created port $port_id for IP $ip"
+        done
+        exit 0
+    else
+        port_id=${port_ids[$((port_selection - 1))]}
+        log_info "Selected Port ID: $port_id"
+    fi
+else
+    error_exit "Invalid port selection."
+fi
+
+#--------------------------------------------------
+# Step 2.5: 多 IP 處理
+#--------------------------------------------------
+fixed_ips_json=$(openstack port show "$port_id" -f json | jq '.fixed_ips')
+ip_count=$(echo "$fixed_ips_json" | jq 'length')
+
+if [ "$ip_count" -gt 1 ]; then
+    echo "This port has multiple IP addresses:"
+    for idx in $(seq 0 $((ip_count - 1))); do
+        ip=$(echo "$fixed_ips_json" | jq -r ".[$idx].ip_address")
+        sub=$(echo "$fixed_ips_json" | jq -r ".[$idx].subnet_id")
+        echo "$((idx + 1)). $ip (subnet $sub)"
+    done
+    read -p "Select an IP by number: " ip_choice
+    [[ "$ip_choice" =~ ^[0-9]+$ ]] \
+      && [ "$ip_choice" -ge 1 ] \
+      && [ "$ip_choice" -le "$ip_count" ] \
+      || error_exit "Invalid IP selection."
+    sel_idx=$((ip_choice - 1))
+else
+    sel_idx=0
+fi
+
+ip_address=$(echo "$fixed_ips_json" | jq -r ".[$sel_idx].ip_address")
+subnet_id=$(echo "$fixed_ips_json" | jq -r ".[$sel_idx].subnet_id")
+
+log_info "Chosen IP: $ip_address (subnet $subnet_id)"
+echo "Chosen IP: $ip_address (subnet $subnet_id)"
+
+#--------------------------------------------------
+# Step 3: 動作選擇
+#--------------------------------------------------
+echo "Choose an action:"
+echo "1. Add"
+echo "2. Replace"
+
+if [ "$ip_count" -gt 1 ]; then
+    echo "3. Remove"
+    allow_remove=true
+else
+    allow_remove=false
+fi
+
+read -p "Select an action by number: " action_selection
+
+case "$action_selection" in
+    1)
+        read -p "Enter the NEW IP address to add: " new_ip
+        validate_ip "$new_ip" || error_exit "Invalid IP address format."
+
+        for row in "${subnet_list[@]}"; do
+            IFS='|' read -r sid ranges <<< "$row"
+            IFS=',' read -ra range_arr <<< "$ranges"
+            for r in "${range_arr[@]}"; do
+                start=${r%-*}
+                end=${r#*-}
+                if ip_in_range "$new_ip" "$start" "$end"; then
+                    add_subnet_id="$sid"
+                    break 2
+                fi
+            done
+        done
+
+        [ -z "$add_subnet_id" ] && error_exit "New IP $new_ip is not in any valid subnet."
+
+        log_info "Adding new IP $new_ip to port $port_id"
+        openstack port set --fixed-ip subnet="$add_subnet_id",ip-address="$new_ip" "$port_id" \
+          || error_exit "Failed to add IP address."
+        ;;
+    2)
+        read -p "Enter the NEW IP address to replace with: " new_ip
+        validate_ip "$new_ip" || error_exit "Invalid IP address format."
+
+        for row in "${subnet_list[@]}"; do
+            IFS='|' read -r sid ranges <<< "$row"
+            IFS=',' read -ra range_arr <<< "$ranges"
+            for r in "${range_arr[@]}"; do
+                start=${r%-*}
+                end=${r#*-}
+                if ip_in_range "$new_ip" "$start" "$end"; then
+                    new_subnet_id="$sid"
+                    break 2
+                fi
+            done
+        done
+
+        [ -z "$new_subnet_id" ] && error_exit "New IP $new_ip is not in any valid subnet."
+
+        log_info "Replacing IP $ip_address with $new_ip on port $port_id"
+        openstack port unset --fixed-ip subnet="$subnet_id",ip-address="$ip_address" "$port_id" \
+          || error_exit "Failed to unset old IP address."
+        openstack port set --fixed-ip subnet="$new_subnet_id",ip-address="$new_ip" "$port_id" \
+          || error_exit "Failed to set new IP address."
+        ;;
+    3)
+        if [ "$allow_remove" = true ]; then
+            read -p "Removing IP $ip_address from port $port_id, type \"YES\" to confirm: " confirm
+            [ "$confirm" = "YES" ] || error_exit "Operation cancelled by user."
+            log_info "Removing IP $ip_address from port $port_id"
+            openstack port unset --fixed-ip subnet="$subnet_id",ip-address="$ip_address" "$port_id" \
+              || error_exit "Failed to remove IP address."
+        else
+            error_exit "Invalid action selected (Remove is not allowed with only 1 IP)."
+        fi
+        ;;
+    *)
+        error_exit "Invalid action selected."
+        ;;
+esac
+
+#--------------------------------------------------
+# Step 4: 顯示結果與更新名稱
+#--------------------------------------------------
+echo "Fetching updated port information..."
+log_info "Fetching updated information for port $port_id"
+
+port_info=$(openstack port show "$port_id" -f json) \
+  || error_exit "Failed to fetch updated port information."
+
+updated_ips=$(echo "$port_info" | jq -r '.fixed_ips[].ip_address')
+ip_array=($updated_ips)
+new_name=$(IFS=, ; echo "${ip_array[*]}")
+
+openstack port set --name "$new_name" "$port_id" \
+  && log_info "Port name updated to \"$new_name\"" \
+  || log_info "Failed to update port name to \"$new_name\""
+
+echo "✅ Updated Port Info:"
+echo "$port_info" | jq '.fixed_ips'

@@ -1,0 +1,33 @@
+#!/bin/bash
+set -e
+
+if [ -f "/etc/appliance/state/install_support_ext_pack_done" ]; then
+    echo "[INFO] Support ext pack already installed, skipping..."
+    exit 1
+else
+    # 1. 安裝 RPM 套件
+    echo "[INFO] Installing local RPM packages..."
+    dnf install -y ./rpm/*.rpm --disablerepo=* --nogpgcheck
+
+    # 2. 複製 ISO
+    echo "[INFO] Copying virtio-win ISO..."
+    cp ./virtio-win-0.1.266.iso /store/
+
+    # 3. 建立掛載目錄並掛載 ISO
+    echo "[INFO] Mounting ISO to /usr/share/virtio-win..."
+    mkdir -p /usr/share/virtio-win
+    mount -o loop /store/virtio-win-0.1.266.iso /usr/share/virtio-win
+
+    # 4. 設定 /etc/fstab 以便開機自動掛載
+    echo "[INFO] Configuring /etc/fstab..."
+    grep -q '/usr/share/virtio-win' /etc/fstab || echo "/store/virtio-win-0.1.266.iso /usr/share/virtio-win iso9660 defaults,loop 0 0" >> /etc/fstab
+
+    # 5. 複製 ext-* 工具
+    echo "[INFO] Copying ext-* tools to /usr/local/bin..."
+    cp ./ext-* /usr/local/bin/
+
+    # 6. git commit changes
+    git add /
+    git commit -m "Add support-ext-pack"
+    echo "[INFO] Marking installation as done..." > /etc/appliance/state/install_support_ext_pack_done
+fi

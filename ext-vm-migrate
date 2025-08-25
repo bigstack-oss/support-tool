@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log()   { echo -e "\e[32m[INFO]\e[0m  $*"; }
+warn()  { echo -e "\e[33m[WARN]\e[0m  $*"; }
+fail()  { echo -e "\e[31m[ERROR]\e[0m $*" >&2; exit 1; }
+
+SRC_IMG=${1:-}
+[ -z "$SRC_IMG" ]            && fail "Usage: $0 <disk-image>"
+[ ! -f "$SRC_IMG" ]           && fail "File not found: $SRC_IMG"
+
+DISK_SIZE=$(qemu-img info $SRC_IMG | grep '^virtual size:' | awk '{print $3, $4}')
+IMG_NAME=$(basename "$SRC_IMG") 
+BASE_NAME=${IMG_NAME%.*}
+TS=$(date +%Y%m%d-%H%M%S)
+OUTDIR=output
+mkdir -p "$OUTDIR"
+
+echo "The disk size is : $DISK_SIZE"
+
+log "Fetching OpenStack projects…"
+PROJ_JSON=$(openstack project list -f json) || fail "Cannot list projects"
+mapfile -t P_IDS   < <(echo "$PROJ_JSON" | jq -r '.[].ID')
+mapfile -t P_NAMES < <(echo "$PROJ_JSON" | jq -r '.[].Name')
+[ ${#P_IDS[@]} -eq 0 ] && fail "No project found"
+
+echo -e "Available Projects:"; for i in "${!P_IDS[@]}"; do echo "$((i+1)). ${P_NAMES[$i]} (${P_IDS[$i]})"; done
+read -p "Select project number: " psel
+[[ ! $psel =~ ^[0-9]+$ ]] || (( psel<1 || psel>${#P_IDS[@]} )) && fail "Invalid selection"
+PROJECT_ID=${P_IDS[$((psel-1))]}
+PROJECT_NAME=${P_NAMES[$((psel-1))]}
+log "Project → $PROJECT_NAME ($PROJECT_ID)"
+
+get_pools() {
+    cinder get-pools 2>/dev/null | awk -F'|' '/\|/ && $2 ~ /name/ {gsub(/^[ \t]+|[ \t]+$/, "", $3); if($3!="") print $3}'
+}
+POOLS=$(get_pools)
+[ -z "$POOLS" ] && fail "No volume pools found by cinder get-pools"
+mapfile -t POOL_ARR < <(echo "$POOLS")
+
+echo -e "Available Pools:"; for i in "${!POOL_ARR[@]}"; do echo "$((i+1)). ${POOL_ARR[$i]}"; done
+read -p "Select pool number: " pool_sel
+[[ ! $pool_sel =~ ^[0-9]+$ ]] || (( pool_sel<1 || pool_sel>${#POOL_ARR[@]} )) && fail "Invalid pool selection"
+POOL=${POOL_ARR[$((pool_sel-1))]}
+log "Pool → $POOL"
+
+openstack role add --user admin_cli --project "$PROJECT_ID" admin || warn "role already set"
+export OS_PROJECT_NAME="$PROJECT_NAME"
+
+RAW_DISK="$OUTDIR/${BASE_NAME}-sda"
+log "Converting $IMG_NAME → RAW (virt-v2v)…"
+virt-v2v -i disk "$SRC_IMG" -o local -of raw -os "$OUTDIR/" || fail "virt-v2v failed"
+[ ! -f "$RAW_DISK" ] && fail "virt-v2v output missing: $RAW_DISK"
+
+if [[ "$POOL" == *cinder-volumes-ssd* ]]; then
+    VOL_POOL="cinder-volumes-ssd"
+    VOL_TYPE="CubeStorage-ssd"
+else
+    VOL_POOL="cinder-volumes"
+    VOL_TYPE="CubeStorage"
+fi
+
+RBD_NAME="${BASE_NAME}-import-${TS}"
+log "Importing to RBD: $VOL_POOL/$RBD_NAME"
+rbd --id cinder import "$RAW_DISK" "$VOL_POOL/$RBD_NAME" || fail "RBD import failed"
+
+VOL_NAME="${BASE_NAME}-${TS}"
+log "Managing volume as $VOL_NAME …"
+cinder manage --bootable --volume-type "$VOL_TYPE" --name "$VOL_NAME" "$POOL" "$RBD_NAME" >/dev/null 2>&1 || fail "cinder manage failed"
+
+cinder image-metadata "$VOL_NAME" set disk_format=raw hw_qemu_guest_agent=True hw_video_model=vga hw_machine_type=q35 hw_scsi_model=virtio-scsi hw_vif_model=virtio hw_input_bus=virtio hw_disk_bus=virtio
+XML="$OUTDIR/${BASE_NAME}.xml"
+if [[ -f "$XML" && $(grep -c "<os firmware='efi'" "$XML") -gt 0 ]]; then
+    cinder image-metadata "$VOL_NAME" set hw_firmware_type=uefi os_secure_boot=optional
+else
+    cinder image-metadata "$VOL_NAME" set hw_firmware_type=bios
+fi
+# 清理 virt-v2v 產生的 RAW 檔案
+rm -f "$OUTDIR/${BASE_NAME}-sda"
+
+openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
+log "✅ Migration completed: $VOL_NAME"
