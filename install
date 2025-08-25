@@ -7,7 +7,21 @@ if [ -f "/etc/appliance/state/install_support_ext_pack_done" ]; then
 else
     # 1. 安裝 RPM 套件
     echo "[INFO] Installing local RPM packages..."
-    dnf install -y ./rpm/*.rpm --disablerepo=* --nogpgcheck
+    for pkg in ./rpm/*.rpm; do
+        rpm_name=$(rpm -qp --queryformat '%{NAME}\n' "$pkg")
+        rpm_ver=$(rpm -qp --queryformat '%{EPOCH}:%{VERSION}-%{RELEASE}\n' "$pkg")
+        if rpm -q --quiet "$rpm_name"; then
+            # Installed: compare versions
+            if rpmdev-vercmp "$(rpm -q --qf '%{EPOCH}:%{VERSION}-%{RELEASE}\n' $rpm_name)" "$rpm_ver" | grep -q '<'; then
+                dnf upgrade -y "$pkg" --disablerepo=* --nogpgcheck
+            else
+                echo "Skipping $pkg (already installed with newer or same version)"
+            fi
+        else
+            # Not installed at all
+            dnf install -y "$pkg" --disablerepo=* --nogpgcheck
+        fi
+    done
 
     # 2. 複製 ISO
     echo "[INFO] Copying virtio-win ISO..."
