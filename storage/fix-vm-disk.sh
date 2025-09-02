@@ -9,20 +9,19 @@ set -euo pipefail
 LOGFILE="/var/log/support-fix-vm-disk.log"
 
 # -------------------------
-# Helpers (grouped at top)
+# Helpers 
 # -------------------------
 log() {
   local msg="$1"
-  echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" | tee -a "$LOGFILE"
+  echo "$msg"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE"
 }
 
 get_vm_state() {
-  # Uses global SERVER_ID
   openstack server show "$SERVER_ID" -f json | jq -r '."OS-EXT-STS:vm_state" // empty'
 }
 
 get_power_status() {
-  # Uses global SERVER_ID
   openstack server show "$SERVER_ID" -f json | jq -r '.status // empty'
 }
 
@@ -84,7 +83,6 @@ map_rbd_image() {
 }
 
 cleanup() {
-  # Uses global DEV_ID
   if [[ -n "${DEV_ID:-}" ]]; then
     if rbd showmapped | awk '{print $5}' | grep -qx "$DEV_ID"; then
       log "Cleanup: unmapping $DEV_ID"
@@ -105,9 +103,8 @@ mkdir -p "$(dirname "$LOGFILE")"
 touch "$LOGFILE"
 chmod 600 "$LOGFILE" || true
 
-# Globals used by helpers
-DEV_ID=""        # /dev/rbdX (set after mapping)
-SERVER_ID=""     # set after user selection
+DEV_ID=""
+SERVER_ID=""
 cur_vm_state=""
 cur_status=""
 
@@ -225,7 +222,8 @@ if [[ -z "$PART_ID" ]]; then
 fi
 
 log "Largest partition: $PART_ID"
-lsblk "$PART_ID" | tee -a "$LOGFILE"
+lsblk "$PART_ID" | tee -a "$LOGFILE" >/dev/null
+lsblk "$PART_ID"
 
 part_type=$(blkid -o value -s TYPE "$PART_ID" || true)
 if [[ -z "$part_type" ]]; then
@@ -240,7 +238,8 @@ if [[ -z "$part_type" ]]; then
 fi
 if [[ -z "$part_type" ]]; then
   log "Warning: Could not auto-detect filesystem. 'file -s' says:"
-  file -s "$PART_ID" | tee -a "$LOGFILE"
+  file -s "$PART_ID" | tee -a "$LOGFILE" >/dev/null
+  file -s "$PART_ID"
   read -rp "Enter filesystem type manually (ext4/xfs/ext3/ext2), or leave blank to abort: " manual_fs
   if [[ -z "$manual_fs" ]]; then
     log "Aborting per user input."
@@ -269,14 +268,16 @@ fi
 log "Repairing filesystem on $PART_ID..."
 case "$part_type" in
   ext4|ext3|ext2)
-    fsck -y "$PART_ID" | tee -a "$LOGFILE"
+    fsck -y "$PART_ID" | tee -a "$LOGFILE" >/dev/null
+    fsck -y "$PART_ID"
     ;;
   xfs)
     if ! command -v xfs_repair &>/dev/null; then
       log "Error: xfs_repair not available."
       exit 1
     fi
-    xfs_repair -L "$PART_ID" | tee -a "$LOGFILE"
+    xfs_repair -L "$PART_ID" | tee -a "$LOGFILE" >/dev/null
+    xfs_repair -L "$PART_ID"
     ;;
   *)
     log "Error: Unsupported or unknown filesystem '$part_type'."
