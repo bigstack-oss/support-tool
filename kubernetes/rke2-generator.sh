@@ -76,11 +76,51 @@ if [[ -z "${network_id:-}" ]]; then
 fi
 echo "netId: $network_id"
 
-router_ports_id=$(openstack port list --network "$network_id" --long -f json | jq -r '.[] | select(."Device Owner"=="network:router_interface") | .ID')
-router_id=$(openstack port show "$router_ports_id" -f json | jq -r '.device_id')
-external_network_id=$(openstack router show "$router_id" -f json | jq -r '.external_gateway_info.network_id')
-external_network_name=$(openstack network show "$external_network_id" -c name -f value)
-echo "floatingPool: $external_network_name ($external_network_id)"
+
+# Get all router-interface ports on this network
+mapfile -t router_ports_ids < <(
+  openstack port list --network "$network_id" --long -f json \
+    | jq -r '.[] | select(."Device Owner"=="network:router_interface") | .ID'
+)
+
+if (( ${#router_ports_ids[@]} == 0 )); then
+  echo "ERROR: No router interface ports found on network '$network_id'."
+  exit 1
+fi
+
+# Collect external networks reachable via routers on this network.
+# Use an associative array to dedupe by external network id.
+declare -A ext_net_name_by_id=()
+declare -a ext_net_ids=()
+
+echo "floatingPool(s) discovered:"
+for pid in "${router_ports_ids[@]}"; do
+  rid=$(openstack port show "$pid" -f json | jq -r '.device_id // empty')
+  [[ -z "$rid" ]] && continue
+
+  ext_id=$(openstack router show "$rid" -f json | jq -r '.external_gateway_info.network_id // empty')
+  [[ -z "$ext_id" ]] && continue
+
+  # Deduplicate by external network id; remember first time we see it
+  if [[ -z "${ext_net_name_by_id[$ext_id]+x}" ]]; then
+    ext_name=$(openstack network show "$ext_id" -c name -f value)
+    ext_net_name_by_id["$ext_id"]="$ext_name"
+    ext_net_ids+=("$ext_id")
+  fi
+
+  # Print each router→external mapping (informational)
+  echo "- via router $rid -> ${ext_net_name_by_id[$ext_id]} ($ext_id)"
+done
+
+if (( ${#ext_net_ids[@]} == 0 )); then
+  echo "ERROR: Routers on this network have no external gateway configured."
+  exit 1
+fi
+
+# Pick the first discovered external network as the default for downstream use
+external_network_id="${ext_net_ids[0]}"
+external_network_name="${ext_net_name_by_id[$external_network_id]}"
+echo "Using floatingPool: $external_network_name ($external_network_id)"
 
 echo 
 echo "Available images:"
@@ -114,8 +154,6 @@ echo "Available flavors:"
 ensure_flavor appfw.medium --vcpus 8  --ram 8192  --disk 200 --property hw:cpu_cores=8  --public
 ensure_flavor appfw.large  --vcpus 12 --ram 12288 --disk 200 --property hw:cpu_cores=12 --public
 ensure_flavor appfw.xlarge --vcpus 16 --ram 16384 --disk 200 --property hw:cpu_cores=16 --public
-
-
 
 # --- Step 7: output configuration & save to file (ASCII box, fixed order) ---
 echo
