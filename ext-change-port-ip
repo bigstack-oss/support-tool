@@ -163,7 +163,7 @@ echo "Fetching OpenStack ports for $network_name..."
 log_info "Fetching OpenStack ports for $network_name..."
 
 echo "IP in used:"
-openstack port list --network ab2777f8-ec5c-46bf-9354-317b6e86d054 -f json \
+openstack port list --network $network_id -f json \
   | jq -r '.[]."Fixed IP Addresses"[]?.ip_address' \
   | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n \
   | nl -w1 -s'. '
