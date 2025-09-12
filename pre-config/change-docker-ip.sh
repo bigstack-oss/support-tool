@@ -19,8 +19,6 @@ log_info() {
 
 trap 'error_exit "Unexpected error at line $LINENO"' ERR
 
-log_info "===== Start support-change-docker-ip ====="
-
 # ------------------------------------------------------------
 # Step 1: Copy daemon.json
 # ------------------------------------------------------------
@@ -69,4 +67,3 @@ systemctl stop docker.socket 2>/dev/null || true
 # Step 6: Done
 # ------------------------------------------------------------
 echo "✔ Ready. You may start cluster setup."
-log_info "===== Completed support-change-docker-ip successfully ====="
