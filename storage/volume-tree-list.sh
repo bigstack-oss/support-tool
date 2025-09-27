@@ -63,7 +63,7 @@ if [ "$status" == "in-use" ]; then
     volume_details=$(openstack volume show $vid -f json)
     server_id=$(echo $volume_details | jq -r '.attachments[0].server_id')
     server_hostname=$(openstack server show $server_id -c hostname -f value 2>/dev/null)
-    echo "$main_volume ($status) - server: $server_hostname($server_id)"
+    echo "$main_volume ($status) - server_id: $server_id($server_hostname)"
 else
     echo "$main_volume ($status)"
 fi
