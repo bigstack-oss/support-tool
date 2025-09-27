@@ -96,8 +96,8 @@ for child in "${CHILDREN[@]}"; do
       ACTIVE)
         log "Server is ACTIVE. Needs stop before cleanup."
         # Print the prompt to terminal, but also log the fact we're asking
-        printf "Type %s to stop %s and proceed: " "$CONFIRM_WORD" "$SERVER_ID" >&3
-        log "Type ${CONFIRM_WORD} to stop ${SERVER_ID} and proceed:"
+        printf "Type %s to stop %s and proceed: " "$CONFIRM_WORD" "$SERVER_NAME" >&3
+        log "Type ${CONFIRM_WORD} to stop ${SERVER_NAME} and proceed:"
         ANSWER=""
         # Read from keyboard (not from redirected stdin)
         # shellcheck disable=SC2162
