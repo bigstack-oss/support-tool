@@ -10,15 +10,15 @@ LOG_FILE="/var/log/support-volume-snapshot.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 # --- Preserve console fds BEFORE redirecting logs ---
-exec 3>&1 4>&2                   # FD3 = original stdout (terminal), FD4 = original stderr (terminal)
+exec 3>&1 4>&2   # FD3 = original stdout (terminal), FD4 = original stderr (terminal)
 
 # --- Redirect all stdout/stderr to logfile ONLY ---
 exec >"$LOG_FILE" 2>&1
 
 ts() { date +'%F %T'; }
-log() { printf "[%s] %s\n" "$(ts)" "$*"; }     # goes to log file
-step() { printf "%s\n" "$*" >&3; }             # goes to terminal via FD3
-errstep() { printf "%s\n" "$*" >&4; }          # if you ever want terminal stderr
+log()   { printf "[%s] %s\n" "$(ts)" "$*"; }  # log file
+step()  { printf "%s\n" "$*" >&3; }           # terminal
+errst() { printf "%s\n" "$*" >&4; }           # terminal stderr (unused)
 
 die() {
   log "ERROR: $*"
@@ -39,13 +39,35 @@ SNAPSHOT_NAME="$(echo "$SNAPSHOT_JSON" | jq -r '.name // empty')"
 VOLUME_ID="$(echo "$SNAPSHOT_JSON" | jq -r '.volume_id')"
 [[ -n "$VOLUME_ID" && "$VOLUME_ID" != "null" ]] || die "Failed to extract volume_id from snapshot $SNAPSHOT_ID"
 
-PARENT_VOL_NAME="$(openstack volume show "$VOLUME_ID" -f value -c name 2>/dev/null || true)"
+PARENT_VOL_JSON="$(openstack volume show "$VOLUME_ID" -f json 2>/dev/null || true)"
+PARENT_VOL_STATUS="$(echo "$PARENT_VOL_JSON" | jq -r '.status // empty')"
+PARENT_VOL_NAME="$(echo "$PARENT_VOL_JSON" | jq -r '.name // empty')"
+
+# Best-effort server details for parent volume (log-only; do not print to terminal per your policy)
+step ""  # blank line
+if [[ "${PARENT_VOL_STATUS:-}" == "in-use" ]]; then
+  SERVER_ID="$(echo "$PARENT_VOL_JSON" | jq -r '.attachments[0].server_id // empty')"
+  SERVER_ID="${SERVER_ID:-}"
+  SERVER_HOSTNAME=""
+  if [[ -n "$SERVER_ID" ]]; then
+    # Use JSON and read OS-EXT-SRV-ATTR:hostname safely
+    _SJSON="$(openstack server show "$SERVER_ID" -f json 2>/dev/null || true)"
+    if [[ -n "${_SJSON:-}" ]]; then
+      SERVER_HOSTNAME="$(echo "$_SJSON" | jq -r '."OS-EXT-SRV-ATTR:hostname" // empty')"
+    fi
+  fi
+  step "Parent Volume: ${VOLUME_ID} (Name: ${PARENT_VOL_NAME:-}, Status: ${PARENT_VOL_STATUS:-})"
+  step "└── server_id: ${SERVER_ID:-}( ${SERVER_HOSTNAME:-} )"
+else
+  step "Parent Volume: ${VOLUME_ID} (Name: ${PARENT_VOL_NAME:-}, Status: ${PARENT_VOL_STATUS:-})"
+fi
+step ""  # blank line
 
 log "Step 1: Resolve volume_id from snapshot: $SNAPSHOT_ID"
 SNAP_SPEC="${POOL}/volume-${VOLUME_ID}@snapshot-${SNAPSHOT_ID}"
 log "Resolved snapshot spec: $SNAP_SPEC"
 
-# Terminal
+# Terminal (concise)
 step "Step 1: Resolve volume_id from snapshot: ${SNAPSHOT_NAME:-N/A}(${SNAPSHOT_ID})"
 
 #---------------------------
@@ -56,7 +78,9 @@ CHILDREN_RAW="$(rbd children "$SNAP_SPEC" 2>/dev/null || true)"
 mapfile -t CHILDREN <<<"$(printf "%s\n" "$CHILDREN_RAW" | sed '/^\s*$/d')"
 CHILD_COUNT="${#CHILDREN[@]}"
 log "Found $CHILD_COUNT child(ren)."
-log "Children exist; processing each child…"
+if (( CHILD_COUNT > 0 )); then
+  log "Children exist; processing each child…"
+fi
 
 step "Step 2: Query RBD children of snapshot"
 
@@ -95,12 +119,10 @@ for child in "${CHILDREN[@]}"; do
         ;;
       ACTIVE)
         log "Server is ACTIVE. Needs stop before cleanup."
-        # Print the prompt to terminal, but also log the fact we're asking
-        printf "Type %s to stop %s and proceed: " "$CONFIRM_WORD" "$SERVER_NAME" >&3
-        log "Type ${CONFIRM_WORD} to stop ${SERVER_NAME} and proceed:"
+        # Terminal prompt + log record
+        printf "Type %s to stop %s and proceed: " "$CONFIRM_WORD" "${SERVER_NAME:-$SERVER_ID}" >&3
+        log "Type ${CONFIRM_WORD} to stop ${SERVER_ID} and proceed:"
         ANSWER=""
-        # Read from keyboard (not from redirected stdin)
-        # shellcheck disable=SC2162
         read ANSWER </dev/tty
         log "User input: ${ANSWER}"
         [[ "$ANSWER" == "$CONFIRM_WORD" ]] || die "Aborted by user."
@@ -153,6 +175,29 @@ if (( ${#SERVER_TO_RESTART[@]} > 0 )); then
     step "Restarting server ${sname:-N/A}(${sid})"
     openstack server start "$sid"
   done
+fi
+
+#---------------------------
+# Step 8: Delete parent volume if available
+#---------------------------
+if [[ "${PARENT_VOL_STATUS}" == "available" ]]; then
+  step "Step 8: Parent Volume ${PARENT_VOL_NAME:-N/A}(${VOLUME_ID}) is available"
+  printf "Do you want to delete the Parent Volume: %s (Name: %s, Status: %s)?\n" \
+    "$VOLUME_ID" "${PARENT_VOL_NAME:-N/A}" "$PARENT_VOL_STATUS" >&3
+  printf "Type %s to delete the volume: " "$CONFIRM_WORD" >&3
+  log "Step 8: Prompting user for parent volume deletion"
+  ANSWER=""
+  read ANSWER </dev/tty
+  log "User input for parent volume delete: ${ANSWER}"
+  if [[ "$ANSWER" == "$CONFIRM_WORD" ]]; then
+    log "Deleting parent volume $VOLUME_ID"
+    step "Deleting parent volume ${PARENT_VOL_NAME:-N/A}(${VOLUME_ID})"
+    openstack volume delete "$VOLUME_ID"
+    log "Parent volume $VOLUME_ID deleted successfully."
+  else
+    log "Parent volume deletion skipped by user."
+    step "Skipped deleting parent volume ${PARENT_VOL_NAME:-N/A}(${VOLUME_ID})"
+  fi
 fi
 
 log "Cleanup finished successfully."
