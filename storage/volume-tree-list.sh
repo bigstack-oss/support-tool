@@ -63,9 +63,12 @@ status=$(openstack volume show $vid -c status -f value 2>/dev/null)
 if [ "$status" == "in-use" ]; then
     volume_details=$(openstack volume show $vid -f json)
     server_id=$(echo $volume_details | jq -r '.attachments[0].server_id')
-    server_name=$(openstack server show $server_id -c name -f value 2>/dev/null)
-    server_status=$(openstack server show $server_id -c status -f value 2>/dev/null)
-    echo "$main_volume ($status) - server_id: $server_id ($server_name), server_status: $server_status"
+    server_details=$(openstack server show $server_id -f json)
+    server_name=$(echo "$server_details" | jq -r '.name')
+    server_status=$(echo "$server_details" | jq -r '.status')
+    project_id=$(echo "$server_details" | jq -r '.project_id')
+    project_name=$(openstack project show $project_id -c name -f value)
+    echo "$main_volume ($status) - server_id: $server_id ($server_name), server_status: $server_status, project_id: $project_id ($project_name)"
 else
     echo "$main_volume ($status)"
 fi
