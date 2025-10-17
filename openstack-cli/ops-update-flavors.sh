@@ -1,3 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+source /etc/admin-openrc.sh
+
 openstack flavor delete pgpu.example
 openstack flavor delete vgpu.example
 openstack flavor delete t2.micro
@@ -18,3 +22,11 @@ openstack flavor create --vcpus 4 --ram 4096 --disk 120 --property hw:cpu_cores=
 openstack flavor create --vcpus 8 --ram 8192 --disk 120 --property hw:cpu_cores=8 --public a2.large
 openstack flavor create --vcpus 16 --ram 16384 --disk 120 --property hw:cpu_threads=2 --property hw:cpu_cores=8 --public a2.xlarge
 openstack flavor create --vcpus 32 --ram 32768 --disk 120 --property hw:cpu_threads=2 --property hw:cpu_cores=16 --public a2.2xlarge
+openstack flavor create --vcpus 4 --ram 4096 --disk 10 --property hw:cpu_cores=4 --public b10.small
+openstack flavor create --vcpus 8 --ram 8192 --disk 10 --property hw:cpu_cores=8 --public b10.medium
+openstack flavor create --vcpus 4 --ram 4096 --disk 20 --property hw:cpu_cores=4 --public b20.small
+openstack flavor create --vcpus 8 --ram 8192 --disk 20 --property hw:cpu_cores=8 --public b20.medium
+openstack flavor create --vcpus 4 --ram 4096 --disk 40 --property hw:cpu_cores=4 --public b40.small
+openstack flavor create --vcpus 8 --ram 8192 --disk 40 --property hw:cpu_cores=8 --public b40.medium
+openstack flavor create --vcpus 4 --ram 4096 --disk 80 --property hw:cpu_cores=4 --public b80.small
+openstack flavor create --vcpus 8 --ram 8192 --disk 80 --property hw:cpu_cores=8 --public b80.medium
