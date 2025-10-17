@@ -46,6 +46,20 @@ volume_id=$(echo "$selected_volume_line" | awk '{print $1}')
 
 echo "Selected volume name: $volume_name"
 
+# os type selection
+echo "Select os type:"
+echo "1. windows"
+echo "2. linux"
+read -p "Enter option number: " os_type_option
+
+case $os_type_option in
+    1) os_type="windows" ;;
+    2) os_type="linux" ;;
+    *) echo "Invalid option"; exit 1 ;;
+esac
+
+echo "Selected os type: $os_type"
+
 # Boot mode selection
 echo "Select boot mode:"
 echo "1. legacy"
@@ -103,6 +117,7 @@ done
 cinder image-metadata $volume_id set disk_format=raw
 cinder image-metadata $volume_id set hw_qemu_guest_agent=True
 cinder image-metadata $volume_id set hw_video_model=vga
+cinder image-metadata $volume_id set os_type=$os_type
 
 # Set image metadata if boot mode is UEFI
 if [[ "$boot_mode" == "UEFI" ]]; then
@@ -120,20 +135,17 @@ fi
 if [[ "$disk_type" == "sata" ]]; then
     echo "Setting sata disk on volume: $volume_name..."
     cinder image-metadata $volume_id set hw_disk_bus=sata
-    cinder image-metadata $volume_id set hw_input_bus=usb
 fi
 
 if [[ "$disk_type" == "scsi" ]]; then
     echo "Setting scsi disk on volume: $volume_name..."
     cinder image-metadata $volume_id set hw_disk_bus=scsi
     cinder image-metadata $volume_id set hw_scsi_model=virtio-scsi
-    cinder image-metadata $volume_id set hw_input_bus=virtio
 fi
 if [[ "$disk_type" == "virtio" ]]; then
     echo "Setting virtio disk on volume: $volume_name..."
     cinder image-metadata $volume_id set hw_disk_bus=virtio
     cinder image-metadata $volume_id set hw_scsi_model=virtio-scsi
-    cinder image-metadata $volume_id set hw_input_bus=virtio
 fi
 echo "Setting network type on volume: $volume_name..."
 cinder image-metadata $volume_id set hw_vif_model=$network_type

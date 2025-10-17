@@ -12,6 +12,7 @@ SRC_IMG=${1:-}
 DISK_SIZE=$(qemu-img info $SRC_IMG | grep '^virtual size:' | awk '{print $3, $4}')
 IMG_NAME=$(basename "$SRC_IMG") 
 BASE_NAME=${IMG_NAME%.*}
+EXTENSION=${IMG_NAME#*.}
 TS=$(date +%Y%m%d-%H%M%S)
 OUTDIR=output
 mkdir -p "$OUTDIR"
@@ -47,7 +48,16 @@ log "Pool → $POOL"
 openstack role add --user admin_cli --project "$PROJECT_ID" admin || warn "role already set"
 export OS_PROJECT_NAME="$PROJECT_NAME"
 
-RAW_DISK="$OUTDIR/${BASE_NAME}-sda"
+if [[ -n "$EXTENSION" ]] && ( [[ "$EXTENSION" = "vhd" ]] || [[ "$EXTENSION" = "vhdx" ]] ); then
+    RAW_DISK="$OUTDIR/${BASE_NAME}.${EXTENSION}-sda"
+    XML="$OUTDIR/${BASE_NAME}.${EXTENSION}.xml"
+    CONVERTED="$OUTDIR/${BASE_NAME}.${EXTENSION}-sda"
+else
+    RAW_DISK="$OUTDIR/${BASE_NAME}-sda"
+    XML="$OUTDIR/${BASE_NAME}.xml"
+    CONVERTED="$OUTDIR/${BASE_NAME}-sda"
+fi
+
 log "Converting $IMG_NAME → RAW (virt-v2v)…"
 virt-v2v -i disk "$SRC_IMG" -o local -of raw -os "$OUTDIR/" || fail "virt-v2v failed"
 [ ! -f "$RAW_DISK" ] && fail "virt-v2v output missing: $RAW_DISK"
@@ -69,14 +79,20 @@ log "Managing volume as $VOL_NAME …"
 cinder manage --bootable --volume-type "$VOL_TYPE" --name "$VOL_NAME" "$POOL" "$RBD_NAME" >/dev/null 2>&1 || fail "cinder manage failed"
 
 cinder image-metadata "$VOL_NAME" set disk_format=raw hw_qemu_guest_agent=True hw_video_model=vga hw_machine_type=q35 hw_scsi_model=virtio-scsi hw_vif_model=virtio hw_input_bus=virtio hw_disk_bus=virtio
-XML="$OUTDIR/${BASE_NAME}.xml"
+
 if [[ -f "$XML" && $(grep -c "<os firmware='efi'" "$XML") -gt 0 ]]; then
     cinder image-metadata "$VOL_NAME" set hw_firmware_type=uefi os_secure_boot=optional
 else
     cinder image-metadata "$VOL_NAME" set hw_firmware_type=bios
 fi
+
+if [[ -f "$XML" && $(grep -c "microsoft" "$XML") -gt 0 ]]; then
+    cinder image-metadata "$VOL_NAME" set os_type=windows
+else
+    cinder image-metadata "$VOL_NAME" set os_type=linux
+fi
 # 清理 virt-v2v 產生的 RAW 檔案
-rm -f "$OUTDIR/${BASE_NAME}-sda"
+rm -f $CONVERTED
 
 openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
 log "✅ Migration completed: $VOL_NAME"

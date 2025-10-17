@@ -61,6 +61,18 @@ selected_name=$(echo "$image_json" | jq -r ".[$selected_index].Name")
 
 echo "✅ You selected: ($selected_id) $selected_name"
 
+echo "Select os type:"
+echo "1. windows"
+echo "2. linux"
+read -p "Enter option number: " os_type_option
+case $os_type_option in
+    1) os_type="windows" ;;
+    2) os_type="linux" ;;
+    *) echo "Invalid option"; exit 1 ;;
+esac
+
+echo "Selected os type: $os_type"
+
 echo "Select boot mode:"
 echo "1. legacy"
 echo "2. UEFI"
@@ -133,6 +145,9 @@ echo "[INFO] Property cleanup done."
 # Set common image properties
 openstack image set --property hw_machine_type=q35 --property hw_video_model=vga "$selected_id"
 
+# Network type
+openstack image set --property os_type="$os_type" "$selected_id"
+
 # Boot mode settings
 if [[ "$boot_mode" == "UEFI" ]]; then
     echo "Setting UEFI mode on image..."
@@ -151,21 +166,18 @@ case $disk_type in
     sata)
         openstack image set \
             --property hw_disk_bus=sata \
-            --property hw_input_bus=usb \
             "$selected_id"
         ;;
     scsi)
         openstack image set \
             --property hw_disk_bus=scsi \
             --property hw_scsi_model=virtio-scsi \
-            --property hw_input_bus=virtio \
             "$selected_id"
         ;;
     virtio)
         openstack image set \
             --property hw_disk_bus=virtio \
             --property hw_scsi_model=virtio-scsi \
-            --property hw_input_bus=virtio \
             "$selected_id"
         ;;
 esac
@@ -176,6 +188,7 @@ openstack image set --property hw_vif_model="$network_type" "$selected_id"
 # Show result
 echo "✅ Image properties set:"
 openstack image show "$selected_id" -f json | jq '.properties | {
+  os_type,
   hw_machine_type,
   hw_scsi_model,
   hw_video_model,
