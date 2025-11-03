@@ -46,6 +46,8 @@ volume_id=$(echo "$selected_volume_line" | awk '{print $1}')
 
 echo "Selected volume name: $volume_name"
 
+openstack volume show $volume_id -f json | jq '.volume_image_metadata'
+
 # os type selection
 echo "Select os type:"
 echo "1. windows"
