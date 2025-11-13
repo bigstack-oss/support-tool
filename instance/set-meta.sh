@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- CONFIG (adjust if needed) ---
-MYSQL_DB_NAME="nova"          # Nova DB name
-MYSQL_CMD="mysql"             # mysql client (assumes ~/.my.cnf has creds)
-
 # --- STEP 1: LIST DOMAINS (EXCLUDE 'HEAT') & SELECT (AUTO-PICK IF SINGLE) ----
 echo
 echo "Select Domain:"
@@ -107,8 +103,7 @@ echo
 echo "Fetching attached volumes for server $selected_server_name ..."
 
 volumes_json=$(
-    openstack server show "$selected_server_id" \
-        -c attached_volumes -f json
+    openstack server show "$selected_server_id" -c attached_volumes -f json
 )
 
 mapfile -t volume_ids < <(
@@ -170,17 +165,16 @@ echo "Volume:  $selected_volume_id"
 echo "os_type: $os_type"
 echo
 
-read -rp "Proceed to update Nova DB and Cinder image-metadata? (YES/NO): " confirm_meta
+read -rp "Proceed to update Metadata? (YES/NO): " confirm_meta
 confirm_meta=${confirm_meta^^}
 
 if [ "$confirm_meta" = "YES" ]; then
-    echo "Updating Nova DB (instances.os_type)..."
-    $MYSQL_CMD "$MYSQL_DB_NAME" -e \
-        "UPDATE instances SET os_type='${os_type}' WHERE uuid='${selected_server_id}';"
-
-    echo "Updating Cinder image-metadata..."
+    mysql nova -e "UPDATE instances SET os_type='${os_type}' WHERE uuid='${selected_server_id}';"
+    mysql nova -e "SELECT uuid,os_type FROM instances WHERE uuid='${selected_server_id}';"
     cinder image-metadata "$selected_volume_id" set os_type="$os_type"
-
+    check_os_type=$(openstack volume show "$selected_volume_id" -f json | jq '.volume_image_metadata.os_type')
+    echo "os_type=$check_os_type"
+    echo
     echo "Metadata update completed."
 else
     echo "Metadata update skipped."
@@ -224,6 +218,3 @@ if [ "$answer" = "YES" ]; then
 else
     echo "Server restart skipped."
 fi
-
-echo
-echo "All steps completed."
