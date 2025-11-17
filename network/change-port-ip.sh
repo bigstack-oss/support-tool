@@ -177,21 +177,23 @@ readarray -t port_info < <(
     [
       .ID,
       (.["Fixed IP Addresses"] | map(.ip_address) | join(",")),
-      ."Device Owner"
+      ."Device Owner",
+      .Status
     ] | @tsv'
 )
 
-port_ids=(); port_ips=(); port_owners=()
+port_ids=(); port_ips=(); port_owners=(); port_statuses=()
 for line in "${port_info[@]}"; do
-    IFS=$'\t' read -r pid pips powner <<< "$line"
+    IFS=$'\t' read -r pid pips powner pstatus <<< "$line"
     port_ids+=("$pid")
     port_ips+=("$pips")
     port_owners+=("$powner")
+    port_statuses+=("$pstatus")
 done
 
 echo "Allocated Ports for Project - $project_name:"
 for i in "${!port_ids[@]}"; do
-    echo "$((i + 1)). ${port_ips[$i]} (${port_owners[$i]})"
+    echo "$((i + 1)). ${port_ips[$i]} (${port_owners[$i],,}, status:${port_statuses[$i]})"
 done
 echo "$(( ${#port_ids[@]} + 1 )). Create a new port(s)"
 
