@@ -173,13 +173,15 @@ ports=$(openstack port list --project "$project_id" --network "$network_id" --lo
 
 readarray -t port_info < <(
   echo "$ports" | jq -r '
-    .[] |
-    [
-      .ID,
-      (.["Fixed IP Addresses"] | map(.ip_address) | join(",")),
-      ."Device Owner",
-      .Status
-    ] | @tsv'
+    .[]
+    | select(."Device Owner" != "network:router_interface")
+    | [
+        .ID,
+        (.["Fixed IP Addresses"] | map(.ip_address) | join(",")),
+        ."Device Owner",
+        .Status
+        ]
+    | @tsv'
 )
 
 port_ids=(); port_ips=(); port_owners=(); port_statuses=()
