@@ -323,7 +323,7 @@ if [[ ! -f "$STATE_FILE" ]]; then
   fi
 
   openstack share delete "$SHARE_ID"
-  touch "$STATE_FILE"
+  cubectl node exec -p "touch ${STATE_FILE}"
   echo "Initiate Manila share is done." 
 fi
 
