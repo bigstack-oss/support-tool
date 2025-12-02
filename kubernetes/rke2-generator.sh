@@ -296,6 +296,36 @@ if [[ -z "${shareNetworkID:-}" ]]; then
 else
   echo "Manila share network already exists: $sn_name ($shareNetworkID)"
 fi
+STATE_FILE="/etc/appliance/state/rke2_${project_name}_manila_init_done"
+
+if [[ ! -f "$STATE_FILE" ]]; then
+  IMAGE_NAME="manila-service-image"
+
+  openstack image show "$IMAGE_NAME" >/dev/null 2>&1 || {
+    echo "ERROR: Image '$IMAGE_NAME' not found. Please import  manila-service-image_yoga with CLI: image import_fs"
+    echo "See https://docs.bigstack.co/docs/cubecos/storage/file/tenant_share."
+    exit 1
+  }
+  echo "Please wait, initiate Manila share ..."
+  SHARE_JSON=$(openstack share create \
+    --share-network "$sn_name" \
+    --share-type tenant_share_type \
+    --name initiate \
+    NFS 1 \
+    --wait \
+    -f json)
+
+  SHARE_ID=$(echo "$SHARE_JSON" | jq -r '.id')
+
+  if [[ -z "$SHARE_ID" || "$SHARE_ID" == "null" ]]; then
+    echo "ERROR: Failed to create share"
+    exit 1
+  fi
+
+  openstack share delete "$SHARE_ID"
+  touch "$STATE_FILE"
+  echo "Initiate Manila share is done." 
+fi
 
 if [[ -z "${shareNetworkID:-}" ]]; then
   echo "ERROR: Failed to obtain shareNetworkID for '$sn_name'."
