@@ -113,6 +113,10 @@ IFS='|' read -r project_id project_name <<< "${project_lines[$((proj_idx-1))]}"
 user_id=$(openstack user list -f json | jq -r '.[] | select(.Name=="admin (IAM)") | .ID')
 openstack role add --user "$user_id" --project "$project_id" admin
 
+# create folder
+dst_dir="./rke2-config/${project_name}"
+mkdir -p "$dst_dir"
+
 # --- Step 3: select network 'private-k8s' in the project ---------------------
 echo
 networks_json=$(openstack network list --project "$project_id" -f json)
@@ -204,8 +208,8 @@ ensure_flavor appfw.xlarge --vcpus 16 --ram 16384 --disk 200 --property hw:cpu_c
 
 # --- Step 7: output configuration & save to file (ASCII box, fixed order) ---
 echo
-outfile="${project_name}-01-rke2-config.txt"
-
+outfile="${dst_dir}/01-rke2-config.txt"
+  
 # Ordered config (parallel arrays)
 keys=(
   "password"
@@ -332,7 +336,7 @@ if [[ -z "${shareNetworkID:-}" ]]; then
   exit 1
 fi
 
-cloud_config="${project_name}-02-cloud-config.yaml"
+cloud_config="${dst_dir}/02-cloud-config.yaml"
 cat > "$cloud_config" <<CC
 secret:
   create: true
@@ -353,7 +357,7 @@ cloudConfig:
     ignore-volume-az: true
 CC
 
-sc_cinder="${project_name}-03-storage-class-cinder-csi.yaml"
+sc_cinder="${dst_dir}/03-storage-class-cinder-csi.yaml"
 cat > "$sc_cinder" <<CCSI
 secret:
   enabled: true
@@ -379,13 +383,13 @@ storageClass:
     deletionPolicy: Delete
 CCSI
 
-sc_driver_nfs="${project_name}-04-csi-driver-nfs.yaml"
+sc_driver_nfs="${dst_dir}/04-csi-driver-nfs.yaml"
 cat > "$sc_driver_nfs" <<SDN
 externalSnapshotter:
   enabled: false
 SDN
 
-manila_secrets="${project_name}-05-manila-csi-secret.yaml"
+manila_secrets="${dst_dir}/05-manila-csi-secret.yaml"
 cat > "$manila_secrets" <<CMSS
 apiVersion: v1
 kind: Secret
@@ -402,7 +406,7 @@ stringData:
   os-TLSInsecure: "true"
 CMSS
 
-sc_manila="${project_name}-06-csi-manila-nfs.yaml"
+sc_manila="${dst_dir}/06-csi-manila-nfs.yaml"
 cat > "$sc_manila" <<YAML
 allowVolumeExpansion: true
 apiVersion: storage.k8s.io/v1
