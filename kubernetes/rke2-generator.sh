@@ -336,61 +336,83 @@ if [[ -z "${shareNetworkID:-}" ]]; then
   exit 1
 fi
 
-cloud_config="${dst_dir}/02-cloud-config.yaml"
-cat > "$cloud_config" <<CC
-secret:
-  create: true
-  name: cloud-config
-cloudConfig:
-  global:
-    auth-url: "${OS_AUTH_URL:-}"
-    tenant-name: "${project_name}"
-    username: "${project_name}"
-    password: "${USER_PASS}"
-    region: "${region_name}"
-    domain-name: "${domain_name}"
-    tls-insecure: "true"
-  loadBalancer:
-    floating-network-id: "${external_network_id}"
-    subnet-id: "${network_subnet_id}"
-  blockStorage:
-    ignore-volume-az: true
-CC
-
-sc_cinder="${dst_dir}/03-storage-class-cinder-csi.yaml"
-cat > "$sc_cinder" <<CCSI
-secret:
-  enabled: true
-  name: cloud-config
-storageClass:
-  enabled: false
-  custom: |-
-    ---
-    apiVersion: storage.k8s.io/v1
-    kind: StorageClass
-    metadata:
-      annotations:
-        storageclass.kubernetes.io/is-default-class: "true"
-      name: csi-cinder
-    provisioner: cinder.csi.openstack.org
-    allowVolumeExpansion: true
-    ---
-    apiVersion: snapshot.storage.k8s.io/v1
-    kind: VolumeSnapshotClass
-    metadata:
-      name: csi-cinder-snapclass
-    driver: cinder.csi.openstack.org
-    deletionPolicy: Delete
-CCSI
-
-sc_driver_nfs="${dst_dir}/04-csi-driver-nfs.yaml"
-cat > "$sc_driver_nfs" <<SDN
-externalSnapshotter:
-  enabled: false
-SDN
-
-manila_secrets="${dst_dir}/05-manila-csi-secret.yaml"
-cat > "$manila_secrets" <<CMSS
+additional_manifest="${dst_dir}/02-additional-manifest.yaml"
+cat > "$additional_manifest" <<CC
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: openstack-cloud-controller-manager
+  annotations:
+    provisioningcattleiodriver: ""
+  finalizers: []
+  generatename: ""
+  labels: {}
+  managedfields: []
+  namespace: kube-system
+  ownerreferences: []
+  resourceversion: ""
+spec:
+  chart: openstack-cloud-controller-manager
+  repo: https://kubernetes.github.io/cloud-provider-openstack
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    secret:
+      create: true
+      name: cloud-config
+    cloudConfig:
+      global:
+        auth-url: "${OS_AUTH_URL:-}"
+        tenant-name: "${project_name}"
+        username: "${project_name}"
+        password: "${USER_PASS}"
+        region: "${region_name}"
+        domain-name: "${domain_name}"
+        tls-insecure: "true"
+      loadBalancer:
+        floating-network-id: "${external_network_id}"
+        subnet-id: "${network_subnet_id}"
+      blockStorage:
+        ignore-volume-az: true
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: openstack-cinder-csi
+  annotations:
+    provisioningcattleiodriver: ""
+  namespace: kube-system
+spec:
+  chart: openstack-cinder-csi
+  repo: https://kubernetes.github.io/cloud-provider-openstack
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    secret:
+      enabled: true
+      name: cloud-config
+    storageClass:
+      enabled: false
+      custom: |-
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata:
+          annotations:
+            storageclass.kubernetes.io/is-default-class: "true"
+          name: csi-cinder
+        provisioner: cinder.csi.openstack.org
+        allowVolumeExpansion: true
+        ---
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshotClass
+        metadata:
+          name: csi-cinder-snapclass
+        driver: cinder.csi.openstack.org
+        deletionPolicy: Delete
+---
 apiVersion: v1
 kind: Secret
 metadata:
@@ -404,36 +426,60 @@ stringData:
   os-password: "${USER_PASS}"
   os-projectName: "${project_name}"
   os-TLSInsecure: "true"
-CMSS
-
-sc_manila="${dst_dir}/06-csi-manila-nfs.yaml"
-cat > "$sc_manila" <<YAML
-allowVolumeExpansion: true
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: csi-driver-nfs
+  annotations:
+    provisioningcattleiodriver: ""
+  namespace: kube-system
+spec:
+  chart: csi-driver-nfs
+  repo: https://kubernetes-csi.github.io/csi-driver-nfs
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    externalSnapshotter:
+      enabled: false
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: openstack-manila-csi
+  annotations:
+    provisioningcattleiodriver: ""
+  namespace: kube-system
+spec:
+  chart: openstack-manila-csi
+  repo: https://kubernetes.github.io/cloud-provider-openstack
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    storageClass:
+      enabled: false
+      custom: |-
+---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: csi-manila-nfs
+provisioner: nfs.manila.csi.openstack.org
+allowVolumeExpansion: true
 parameters:
-  csi.storage.k8s.io/controller-expand-secret-name: csi-manila-secrets
-  csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
-  csi.storage.k8s.io/node-publish-secret-name: csi-manila-secrets
-  csi.storage.k8s.io/node-publish-secret-namespace: kube-system
-  csi.storage.k8s.io/node-stage-secret-name: csi-manila-secrets
-  csi.storage.k8s.io/node-stage-secret-namespace: kube-system
+  type: tenant_share_type
+  shareNetworkID: "${shareNetworkID}"
   csi.storage.k8s.io/provisioner-secret-name: csi-manila-secrets
   csi.storage.k8s.io/provisioner-secret-namespace: kube-system
-  shareNetworkID: "${shareNetworkID}"
-  type: tenant_share_type
-provisioner: nfs.manila.csi.openstack.org
-reclaimPolicy: Delete
-volumeBindingMode: Immediate
-YAML
+  csi.storage.k8s.io/controller-expand-secret-name: csi-manila-secrets
+  csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
+  csi.storage.k8s.io/node-stage-secret-name: csi-manila-secrets
+  csi.storage.k8s.io/node-stage-secret-namespace: kube-system
+  csi.storage.k8s.io/node-publish-secret-name: csi-manila-secrets
+  csi.storage.k8s.io/node-publish-secret-namespace: kube-system
+CC
 
 echo
 echo "Config files written:"
 echo "- $outfile"
-echo "- $cloud_config"
-echo "- $sc_cinder"
-echo "- $sc_driver_nfs"
-echo "- $manila_secrets"
-echo "- $sc_manila"
+echo "- $additional_manifest"
