@@ -436,7 +436,7 @@ metadata:
   namespace: kube-system
 spec:
   chart: csi-driver-nfs
-  repo: https://kubernetes-csi.github.io/csi-driver-nfs
+  repo: https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
   targetNamespace: kube-system
   bootstrap: true
   valuesContent: |
