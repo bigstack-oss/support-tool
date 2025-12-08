@@ -88,6 +88,17 @@ if [[ "$migration_type" == "disk" ]]; then
     cinder image-metadata "$VOL_NAME" set disk_format=raw hw_machine_type=q35
     VOL_ID=$(openstack volume show "$VOL_NAME" -f value -c id)
     rbd du "$VOL_POOL/volume-$VOL_ID" || warn "rbd du failed"
+    BLK_ID=$(rbd map --pool $VOL_POOL "volume-$VOL_ID")
+    DISTRO=$(virt-inspector -a "$BLK_ID" | xmllint --xpath 'normalize-space(//distro)' -)
+    if [[ "$DISTRO" == *"windows"* ]]; then
+        echo "Detected Windows OS, setting os_type metadata"
+        cinder image-metadata "$VOL_NAME" set os_type=windows
+    else
+        echo "Detected Linux OS, setting os_type metadata"
+        cinder image-metadata "$VOL_NAME" set os_type=linux
+    fi
+    rbd unmap "$BLK_ID" || warn "rbd unmap failed"
+    openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
     log "✅ Migration completed: $VOL_NAME"
     exit 0
 fi
