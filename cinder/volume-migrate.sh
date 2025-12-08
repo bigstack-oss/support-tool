@@ -11,6 +11,7 @@ SRC_IMG=${1:-}
 
 DISK_SIZE=$(qemu-img info $SRC_IMG | grep '^virtual size:' | awk '{print $3, $4}')
 FILE_FORMAT=$(qemu-img info "$SRC_IMG" | grep "file format" | awk -F': ' '{print $2}')
+DISK_USAGE=$(qemu-img info "$SRC_IMG" | grep "disk size" | awk -F': ' '{print $2;exit}')
 IMG_NAME=$(basename "$SRC_IMG") 
 BASE_NAME=${IMG_NAME%.*}
 EXTENSION=${IMG_NAME#*.}
@@ -18,7 +19,8 @@ TS=$(date +%Y%m%d-%H%M%S)
 OUTDIR=output
 mkdir -p "$OUTDIR"
 
-echo "The disk size is : $DISK_SIZE"
+echo "The disk usage is : $DISK_USAGE"
+echo "The partition size is : $DISK_SIZE"
 echo "The file format is : $FILE_FORMAT"
 
 log "Fetching OpenStack projects…"
