@@ -10,6 +10,7 @@ SRC_IMG=${1:-}
 [ ! -f "$SRC_IMG" ]           && fail "File not found: $SRC_IMG"
 
 DISK_SIZE=$(qemu-img info $SRC_IMG | grep '^virtual size:' | awk '{print $3, $4}')
+FILE_FORMAT=$(qemu-img info "$SRC_IMG" | grep "file format" | awk -F': ' '{print $2}')
 IMG_NAME=$(basename "$SRC_IMG") 
 BASE_NAME=${IMG_NAME%.*}
 EXTENSION=${IMG_NAME#*.}
@@ -18,6 +19,7 @@ OUTDIR=output
 mkdir -p "$OUTDIR"
 
 echo "The disk size is : $DISK_SIZE"
+echo "The file format is : $FILE_FORMAT"
 
 log "Fetching OpenStack projects…"
 PROJ_JSON=$(openstack project list -f json) || fail "Cannot list projects"
@@ -30,6 +32,8 @@ read -p "Select project number: " psel
 [[ ! $psel =~ ^[0-9]+$ ]] || (( psel<1 || psel>${#P_IDS[@]} )) && fail "Invalid selection"
 PROJECT_ID=${P_IDS[$((psel-1))]}
 PROJECT_NAME=${P_NAMES[$((psel-1))]}
+openstack role add --user admin_cli --project "$PROJECT_ID" admin || warn "role already set"
+export OS_PROJECT_NAME="$PROJECT_NAME"
 log "Project → $PROJECT_NAME ($PROJECT_ID)"
 
 get_pools() {
@@ -44,9 +48,47 @@ read -p "Select pool number: " pool_sel
 [[ ! $pool_sel =~ ^[0-9]+$ ]] || (( pool_sel<1 || pool_sel>${#POOL_ARR[@]} )) && fail "Invalid pool selection"
 POOL=${POOL_ARR[$((pool_sel-1))]}
 log "Pool → $POOL"
+if [[ "$POOL" == *cinder-volumes-ssd* ]]; then
+    VOL_POOL="cinder-volumes-ssd"
+    VOL_TYPE="CubeStorage-ssd"
+else
+    VOL_POOL="cinder-volumes"
+    VOL_TYPE="CubeStorage"
+fi
 
-openstack role add --user admin_cli --project "$PROJECT_ID" admin || warn "role already set"
-export OS_PROJECT_NAME="$PROJECT_NAME"
+# os type selection
+echo "Select migration type:"
+echo "1. disk"
+echo "2. v2v"
+read -p "Enter option number: " migration_type_option
+
+case $migration_type_option in
+    1) migration_type="disk" ;;
+    2) migration_type="v2v" ;;
+    *) echo "Invalid option"; exit 1 ;;
+esac
+
+echo "Selected migration type: $migration_type"
+
+if [[ "$migration_type" == "disk" ]]; then
+    log "Importing disk image directly to Cinder RBD…"
+    
+    if [[ "$FILE_FORMAT" != "raw" ]]; then
+        log "Converting $IMG_NAME to $VOL_POOL with RAW format "
+        qemu-img convert -p -O raw "$SRC_IMG" "rbd:$VOL_POOL/${BASE_NAME}-converted.raw" || fail "qemu-img convert failed"
+    fi
+
+    RBD_NAME="${BASE_NAME}-converted.raw"
+
+    VOL_NAME="${BASE_NAME}-${TS}"
+    log "Managing volume as $VOL_NAME …"
+    cinder manage --bootable --volume-type "$VOL_TYPE" --name "$VOL_NAME" "$POOL" "$RBD_NAME" >/dev/null 2>&1 || fail "cinder manage failed"
+    cinder image-metadata "$VOL_NAME" set disk_format=raw hw_machine_type=q35
+    VOL_ID=$(openstack volume show "$VOL_NAME" -f value -c id)
+    rbd du "$VOL_POOL/volume-$VOL_ID" || warn "rbd du failed"
+    log "✅ Migration completed: $VOL_NAME"
+    exit 0
+fi
 
 if [[ -n "$EXTENSION" ]] && ( [[ "$EXTENSION" = "vhd" ]] || [[ "$EXTENSION" = "vhdx" ]] ); then
     RAW_DISK="$OUTDIR/${BASE_NAME}.${EXTENSION}-sda"
@@ -61,14 +103,6 @@ fi
 log "Converting $IMG_NAME → RAW (virt-v2v)…"
 virt-v2v -i disk "$SRC_IMG" -o local -of raw -os "$OUTDIR/" || fail "virt-v2v failed"
 [ ! -f "$RAW_DISK" ] && fail "virt-v2v output missing: $RAW_DISK"
-
-if [[ "$POOL" == *cinder-volumes-ssd* ]]; then
-    VOL_POOL="cinder-volumes-ssd"
-    VOL_TYPE="CubeStorage-ssd"
-else
-    VOL_POOL="cinder-volumes"
-    VOL_TYPE="CubeStorage"
-fi
 
 RBD_NAME="${BASE_NAME}-import-${TS}"
 log "Importing to RBD: $VOL_POOL/$RBD_NAME"
@@ -95,4 +129,6 @@ fi
 rm -f $CONVERTED
 
 openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
+VOL_ID=$(openstack volume show "$VOL_NAME" -f value -c id)
+rbd du "$VOL_POOL/volume-$VOL_ID" || warn "rbd du failed"
 log "✅ Migration completed: $VOL_NAME"
