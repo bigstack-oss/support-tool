@@ -61,6 +61,17 @@ selected_name=$(echo "$image_json" | jq -r ".[$selected_index].Name")
 
 echo "✅ You selected: ($selected_id) $selected_name"
 
+openstack image show "$selected_id" -f json | jq '.properties | {
+  os_type,
+  hw_machine_type,
+  hw_scsi_model,
+  hw_video_model,
+  os_secure_boot,
+  hw_firmware_type,
+  hw_disk_bus,
+  hw_vif_model
+}'
+
 echo "Select os type:"
 echo "1. windows"
 echo "2. linux"
@@ -130,7 +141,6 @@ props_json=$(openstack image show "$selected_id" -f json | jq -r '.properties')
 
 for key in "${to_unset[@]}"; do
     if echo "$props_json" | jq -e "has(\"$key\")" >/dev/null; then
-        echo "  • unset $key"
         if [ "$key" = "os_secure_boot" ]; then
             # 使用 glance v2 CLI 移除受保護屬性
             export OS_IMAGE_API_VERSION=2
@@ -192,7 +202,6 @@ openstack image show "$selected_id" -f json | jq '.properties | {
   hw_machine_type,
   hw_scsi_model,
   hw_video_model,
-  hw_input_bus,
   os_secure_boot,
   hw_firmware_type,
   hw_disk_bus,

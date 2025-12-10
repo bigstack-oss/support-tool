@@ -125,10 +125,10 @@ if [[ "$migration_type" == "disk" ]]; then
     DISTRO=$(virt-inspector -a "$BLK_ID" | xmllint --xpath 'normalize-space(//distro)' - 2>/dev/null || echo "")
 
     if [[ "$DISTRO" == *"windows"* ]]; then
-        log "Detected Windows OS, setting os_type=windows"
+        log "Set os_type=windows"
         cinder image-metadata "$VOL_NAME" set os_type=windows
     else
-        log "Detected non-Windows or unknown OS, setting os_type=linux"
+        log "Set os_type=linux"
         cinder image-metadata "$VOL_NAME" set os_type=linux
     fi
 
@@ -189,4 +189,4 @@ rm -f "$CONVERTED"
 openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
 VOL_ID=$(openstack volume show "$VOL_NAME" -f value -c id)
 rbd du "$VOL_POOL/volume-$VOL_ID" || warn "rbd du failed"
-log "✅ Migration completed: $VOL_NAME"
+log "✅ Migration completed: $VOL_NAME (ID: $VOL_ID)"

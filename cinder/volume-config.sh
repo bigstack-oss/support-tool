@@ -120,18 +120,19 @@ cinder image-metadata $volume_id set disk_format=raw
 cinder image-metadata $volume_id set hw_qemu_guest_agent=True
 cinder image-metadata $volume_id set hw_video_model=vga
 cinder image-metadata $volume_id set os_type=$os_type
+cinder image-metadata $volume_id set hw_machine_type=q35
 
 # Set image metadata if boot mode is UEFI
 if [[ "$boot_mode" == "UEFI" ]]; then
     echo "Setting UEFI on volume: $volume_name..."
     cinder image-metadata $volume_id set hw_firmware_type=uefi
-    cinder image-metadata $volume_id set hw_machine_type=q35
     cinder image-metadata $volume_id set os_secure_boot=optional
 fi
 
 # Set image metadata if boot mode is legacy
 if [[ "$boot_mode" == "legacy" ]]; then
     echo "Setting legacy on volume: $volume_name..."
+    cinder image-metadata $volume_id set hw_firmware_type=bios
 fi
 # Set image metadata if boot mode is default
 if [[ "$disk_type" == "sata" ]]; then
