@@ -27,8 +27,12 @@ fail() {
 }
 
 SRC_IMG=${1:-}
-[ -z "$SRC_IMG" ]             && fail "Usage: $0 <disk-image>"
-[ ! -f "$SRC_IMG" ]           && fail "File not found: $SRC_IMG"
+TMP_DIR=${2:-}
+[ -z "$SRC_IMG" ] && fail "Usage: $0 <disk-image> [<temp-dir>]"
+[ ! -f "$SRC_IMG" ] && fail "File not found: $SRC_IMG"
+
+# Default output directory
+DEFAULT_OUTDIR="/mnt/cephfs/glance/output"
 
 DISK_SIZE=$(qemu-img info "$SRC_IMG" | grep '^virtual size:' | awk '{print $3, $4}')
 FILE_FORMAT=$(qemu-img info "$SRC_IMG" | grep "file format" | awk -F': ' '{print $2}')
@@ -37,8 +41,8 @@ IMG_NAME=$(basename "$SRC_IMG")
 BASE_NAME=${IMG_NAME%.*}
 EXTENSION=${IMG_NAME#*.}
 TS=$(date +%Y%m%d-%H%M%S)
-OUTDIR=output
-mkdir -p "$OUTDIR"
+OUTDIR="${TMP_DIR:-$DEFAULT_OUTDIR}"
+mkdir -p "$OUTDIR" || fail "Unable to create directory: $OUTDIR"
 
 echo "The disk usage is : $DISK_USAGE"
 echo "The partition size is : $DISK_SIZE"
@@ -88,13 +92,14 @@ fi
 
 # migration type selection
 echo "Select migration type:"
-echo "1. disk"
-echo "2. v2v"
+echo "1. v2v (Operating System)"
+echo "2. disk (Raw Disk Import)"
+
 read -p "Enter option number: " migration_type_option
 
 case $migration_type_option in
-    1) migration_type="disk" ;;
-    2) migration_type="v2v" ;;
+    1) migration_type="v2v" ;;
+    2) migration_type="disk" ;;
     *) fail "Invalid migration type option" ;;
 esac
 
@@ -105,8 +110,9 @@ if [[ "$migration_type" == "disk" ]]; then
 
     if [[ "$FILE_FORMAT" != "raw" ]]; then
         log "Converting $IMG_NAME to $VOL_POOL with RAW format"
-        qemu-img convert -p -O raw "$SRC_IMG" "rbd:$VOL_POOL/${BASE_NAME}-converted.raw" \
-          || fail "qemu-img convert failed"
+        qemu-img convert -p -O raw "$SRC_IMG" "rbd:$VOL_POOL/${BASE_NAME}-converted.raw" || fail "qemu-img convert failed"
+    else
+		rbd --id cinder import "$SRC_IMG" "$VOL_POOL/${BASE_NAME}" || fail "RBD import failed"
     fi
 
     RBD_NAME="${BASE_NAME}-converted.raw"
@@ -150,7 +156,7 @@ else
 fi
 
 log "Converting $IMG_NAME → RAW (virt-v2v)…"
-virt-v2v -i disk "$SRC_IMG" -o local -of raw -os "$OUTDIR/" || fail "virt-v2v failed"
+LIBGUESTFS_BACKEND=direct virt-v2v -i disk "$SRC_IMG" -o local -of raw -os "$OUTDIR/" || fail "virt-v2v failed"
 [ ! -f "$RAW_DISK" ] && fail "virt-v2v output missing: $RAW_DISK"
 
 RBD_NAME="${BASE_NAME}-import-${TS}"
