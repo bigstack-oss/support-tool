@@ -106,19 +106,17 @@ esac
 echo "Selected migration type: $migration_type"
 
 if [[ "$migration_type" == "disk" ]]; then
-    log "Importing disk image directly to Cinder RBD…"
-
     if [[ "$FILE_FORMAT" != "raw" ]]; then
         log "Converting $IMG_NAME to $VOL_POOL with RAW format"
         qemu-img convert -p -O raw "$SRC_IMG" "rbd:$VOL_POOL/${BASE_NAME}-converted.raw" || fail "qemu-img convert failed"
     else
-		rbd --id cinder import "$SRC_IMG" "$VOL_POOL/${BASE_NAME}" || fail "RBD import failed"
+        log "Import $IMG_NAME to $VOL_POOL"
+		rbd --id cinder import "$SRC_IMG" "$VOL_POOL/${BASE_NAME}-converted.raw" || fail "RBD import failed"
     fi
 
     RBD_NAME="${BASE_NAME}-converted.raw"
-
     VOL_NAME="${BASE_NAME}-${TS}"
-    log "Managing volume as $VOL_NAME …"
+    log "Managing volume: $VOL_NAME"
     cinder manage --bootable --volume-type "$VOL_TYPE" --name "$VOL_NAME" "$POOL" "$RBD_NAME" \
       >/dev/null 2>&1 || fail "cinder manage failed"
 
