@@ -37,15 +37,20 @@ else
 fi
 
 # VM data
-vm_data=$(openstack server show "$compute_id" -c name -c image -c created -f value)
-vm_create_date=$(echo "$vm_data" | awk 'NR==1')
-glance_image=$(echo "$vm_data" | awk 'NR==2')
-compute_name=$(echo "$vm_data" | awk 'NR==3')
+vm_data=$(openstack server show "$compute_id" -c name -c image -c created -c compute_host -c instance_name -f value)
+compute_host=$(echo "$vm_data" | awk 'NR==1')
+vm_create_date=$(echo "$vm_data" | awk 'NR==2')
+glance_image=$(echo "$vm_data" | awk 'NR==3')
+compute_name=$(echo "$vm_data" | awk 'NR==4')
+instance_name=$(echo "$vm_data" | awk 'NR==5')
 
 if [ -z "$compute_name" ]; then
     compute_name="N/A"
     glance_image="N/A"
     vm_create_date="N/A"
+    compute_host="N/A"
+    instance_name="N/A"
+
 fi
 
 # Get floating VIP
@@ -60,10 +65,12 @@ echo "Loadbalancer ID: $loadbalancer_id"
 echo "Loadbalancer Name: $loadbalancer_name"
 echo "Project: $state $project_name ($project_id)"
 echo "Provision status: $provisioning_status"
-echo "Admin VM name: $compute_name"
+echo "Admin VM name: $instance_name"
 echo "Admin VM ID: $compute_id"
 echo "Admin VM Image: $glance_image"
 echo "Admin VM create on: $vm_create_date"
+echo "Compute Node: $compute_host"
+echo "Virsh Domain: $compute_name"
 echo "lb-mgmt-net IP: $lb_network_ip"
 echo "Floating IP: $loadbalancer_vip"
 echo "---------------------------------------------"
