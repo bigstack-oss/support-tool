@@ -111,6 +111,10 @@ IFS='|' read -r project_id project_name <<< "${project_lines[$((proj_idx-1))]}"
 
 # Assign 'admin' role to user 'admin (IAM)' in the selected project
 user_id=$(openstack user list -f json | jq -r '.[] | select(.Name=="admin (IAM)") | .ID')
+if [ -z "$user_id" ]; then
+    echo "Error: User 'admin (IAM)' not found. Please login to your account admin (IAM) first."
+    exit 1
+fi
 openstack role add --user "$user_id" --project "$project_id" admin
 openstack role add --user admin_cli --project "$project_id" admin
 
