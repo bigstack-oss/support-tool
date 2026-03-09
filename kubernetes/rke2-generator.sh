@@ -202,7 +202,53 @@ if [[ -z "${user_id:-}" ]]; then
 fi
 
 # --- Step 5: generate user password from project name ------------------------
-USER_PASS=$(echo -n "$project_name" | openssl dgst -sha1 -hmac cube2022 | awk '{print $2}')
+FW_NAME=$(
+  /usr/sbin/hex_cli -c firmware list \
+  | awk '
+      /^\s*[0-9]+:/ {
+        if ($0 ~ /\[ACTIVE\]/) {
+          sub(/^\s*[0-9]+:[[:space:]]*/, "", $0)
+          sub(/[[:space:]]*\[ACTIVE\].*$/, "", $0)
+          print $0
+          exit
+        }
+      }
+    '
+)
+FW_VER=$(echo "$FW_NAME" | awk -F'_' '{print $2}')
+FW_DATE_RAW=$(echo "$FW_NAME" | awk -F'_' '{print $3}')
+FW_DATE=${FW_DATE_RAW%%-*}
+SECRET_SEED=$(
+  awk -F': *' '
+    /^[[:space:]]*secret-seed[[:space:]]*:/ {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+      print $2
+      exit
+    }
+  ' /etc/policies/cubesys/cubesys1_0.yml
+)
+
+version_ge() {
+  local v1="$1" v2="$2"
+  local IFS=.
+  local a b i
+  read -r -a a <<< "$v1"
+  read -r -a b <<< "$v2"
+
+  for ((i=0; i<3; i++)); do
+    local x="${a[i]:-0}"
+    local y="${b[i]:-0}"
+    ((10#$x > 10#$y)) && return 0
+    ((10#$x < 10#$y)) && return 1
+  done
+  return 0
+}
+
+if version_ge "$FW_VER" "3.1.0" && [[ "$FW_DATE" -ge 20260301 ]]; then
+  USER_PASS=$(echo -n "$project_name$SECRET_SEED" | openssl dgst -sha1 | awk '{print $2}')
+else
+  USER_PASS=$(echo -n "$project_name" | openssl dgst -sha1 -hmac cube2022 | awk '{print $2}')
+fi
 
 # --- Step 6: ensure flavors exist -------------------------------------------
 echo
