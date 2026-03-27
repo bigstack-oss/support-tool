@@ -17,7 +17,7 @@ done
 
 HORIZON_USER="admin"
 HORIZON_USER_ID=$(openstack user show $HORIZON_USER -c id -f value 2>/dev/null)
-EXTRA_JSON='{"real_name": "Admin (Local)", "description": "Default Horizon admin user"}'
+EXTRA_JSON='{"real_name": "Admin (Local)", "description": "Default local admin user"}'
 if [ -n "$HORIZON_USER_ID" ]; then
     echo "-- Updating user $HORIZON_USER (ID: $HORIZON_USER_ID)"
     mysql -u root keystone -e "UPDATE user SET extra='$EXTRA_JSON' WHERE id='$HORIZON_USER_ID';"
@@ -25,7 +25,7 @@ fi
 
 KEYCLOAK_USER="admin (IAM)"
 KEYCLOAK_USER_ID=$(openstack user show "${KEYCLOAK_USER}" -c id -f value 2>/dev/null)
-EXTRA_JSON='{"real_name": "Admin (Keycloak)", "description": "Default admin user"}'
+EXTRA_JSON='{"real_name": "Admin (Keycloak)", "description": "Default SSO admin user"}'
 if [ -n "$KEYCLOAK_USER_ID" ]; then
     echo "-- Updating user $KEYCLOAK_USER (ID: $KEYCLOAK_USER_ID)"
     mysql -u root keystone -e "UPDATE user SET extra='$EXTRA_JSON' WHERE id='$KEYCLOAK_USER_ID';"
