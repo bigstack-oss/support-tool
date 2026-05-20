@@ -9,30 +9,46 @@ read -p "Enter choice [1-2]: " visibility_choice
 
 if [ "$visibility_choice" = "1" ]; then
     echo "Fetching public images..."
+    # Filters specifically for public visibility across all projects
     image_json=$(openstack image list --long -f json --all | jq '[.[] | select(.Visibility=="public")]')
+
 elif [ "$visibility_choice" = "2" ]; then
     echo "Fetching project list..."
-    projects=$(openstack project list -f value -c ID -c Name)
-    IFS=$'\n' read -d '' -r -a project_array <<< "$projects"
+    
+    # Store projects in an array using mapfile (requires Bash 4+)
+    mapfile -t project_array < <(openstack project list -f value -c ID -c Name)
 
-    echo "Select a project:"
+    # Check if the list is empty
+    if [ ${#project_array[@]} -eq 0 ]; then
+        echo "Error: No projects found. Check your permissions."
+        exit 1
+    fi
+
+    echo "--- Available Projects ---"
     for i in "${!project_array[@]}"; do
-        pid=$(echo "${project_array[$i]}" | awk '{print $1}')
-        pname=$(echo "${project_array[$i]}" | cut -d' ' -f2-)
-        echo "$((i+1)). $pid ($pname)"
+        echo "$((i+1)). ${project_array[$i]}"
     done
+    echo "--------------------------"
 
-    read -p "Enter project number: " project_index
-    project_index=$((project_index-1))
+    read -p "Enter project number: " project_num
 
-    selected_project_line="${project_array[$project_index]}"
+    # Validate input is a number and within range
+    if [[ ! "$project_num" =~ ^[0-9]+$ ]] || [ "$project_num" -lt 1 ] || [ "$project_num" -gt "${#project_array[@]}" ]; then
+        echo "Invalid selection."
+        exit 1
+    fi
+
+    # Extract ID from the selected line (the first column)
+    selected_project_line="${project_array[$((project_num-1))]}"
     project_id=$(echo "$selected_project_line" | awk '{print $1}')
-    project_name=$(echo "$selected_project_line" | cut -d' ' -f2-)
-    echo "Selected project: $project_name"
+    project_name=$(echo "$selected_project_line" | awk '{$1=""; print $0}' | sed 's/^[ \t]*//')
 
+    echo "Selected project: $project_name ($project_id)"
+    echo "Fetching images for project..."
     image_json=$(openstack image list --project="$project_id" --long -f json)
+
 else
-    echo "Invalid choice"
+    echo "Invalid choice. Please enter 1 or 2."
     exit 1
 fi
 
