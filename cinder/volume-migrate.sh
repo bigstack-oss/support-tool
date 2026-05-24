@@ -10,19 +10,25 @@ touch "$LOGFILE" || {
 }
 
 log() {
-    echo -e "\e[32m[INFO]\e[0m  $*"
+    local msg="$*"
+    local dt=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "\e[32m[INFO]\e[0m  $dt $msg"
     # log to file (plain text, timestamp)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO]  $*" >> "$LOGFILE" 2>/dev/null || true
+    echo "$dt [INFO]  $msg" >> "$LOGFILE" 2>/dev/null || true
 }
 
 warn() {
-    echo -e "\e[33m[WARN]\e[0m  $*"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN]  $*" >> "$LOGFILE" 2>/dev/null || true
+    local msg="$*"
+    local dt=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "\e[33m[WARN]\e[0m  $dt $msg"
+    echo "$dt [WARN]  $msg" >> "$LOGFILE" 2>/dev/null || true
 }
 
 fail() {
-    echo -e "\e[31m[ERROR]\e[0m $*" >&2
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $*" >> "$LOGFILE" 2>/dev/null || true
+    local msg="$*"
+    local dt=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "\e[31m[ERROR]\e[0m $dt $msg" >&2
+    echo "$dt [ERROR] $msg" >> "$LOGFILE" 2>/dev/null || true
     exit 1
 }
 
@@ -73,13 +79,19 @@ POOLS=$(get_pools)
 [ -z "$POOLS" ] && fail "No volume pools found by cinder get-pools"
 mapfile -t POOL_ARR < <(echo "$POOLS")
 
-echo -e "Available Pools:"
-for i in "${!POOL_ARR[@]}"; do
-    echo "$((i+1)). ${POOL_ARR[$i]}"
-done
-read -p "Select pool number: " pool_sel
-[[ ! $pool_sel =~ ^[0-9]+$ ]] || (( pool_sel<1 || pool_sel>${#POOL_ARR[@]} )) && fail "Invalid pool selection"
-POOL=${POOL_ARR[$((pool_sel-1))]}
+# --- AUTO-SELECT POOL IF ONLY ONE EXISTS ---
+if [ ${#POOL_ARR[@]} -eq 1 ]; then
+    POOL=${POOL_ARR[0]}
+    log "Only one pool available. Auto-selecting: $POOL"
+else
+    echo -e "Available Pools:"
+    for i in "${!POOL_ARR[@]}"; do
+        echo "$((i+1)). ${POOL_ARR[$i]}"
+    done
+    read -p "Select pool number: " pool_sel
+    [[ ! $pool_sel =~ ^[0-9]+$ ]] || (( pool_sel<1 || pool_sel>${#POOL_ARR[@]} )) && fail "Invalid pool selection"
+    POOL=${POOL_ARR[$((pool_sel-1))]}
+fi
 log "Pool → $POOL"
 
 if [[ "$POOL" == *cinder-volumes-ssd* ]]; then
@@ -107,11 +119,13 @@ echo "Selected migration type: $migration_type"
 
 if [[ "$migration_type" == "disk" ]]; then
     if [[ "$FILE_FORMAT" != "raw" ]]; then
+        # Date/Time handled by log()
         log "Converting $IMG_NAME to $VOL_POOL with RAW format"
         qemu-img convert -p -O raw "$SRC_IMG" "rbd:$VOL_POOL/${BASE_NAME}-converted.raw" || fail "qemu-img convert failed"
     else
+        # Date/Time handled by log()
         log "Import $IMG_NAME to $VOL_POOL"
-		rbd --id cinder import "$SRC_IMG" "$VOL_POOL/${BASE_NAME}-converted.raw" || fail "RBD import failed"
+        rbd --id cinder import "$SRC_IMG" "$VOL_POOL/${BASE_NAME}-converted.raw" || fail "RBD import failed"
     fi
 
     RBD_NAME="${BASE_NAME}-converted.raw"
@@ -139,7 +153,7 @@ if [[ "$migration_type" == "disk" ]]; then
     rbd unmap "$BLK_ID" || warn "rbd unmap failed"
 
     openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
-    log "✅ Migration completed: $VOL_NAME"
+    log "✅ Migration completed: $VOL_NAME (ID: $VOL_ID)"
     exit 0
 fi
 
