@@ -2,6 +2,7 @@
 
 ## support fixpack 310
 - Download: https://s3.bigstack.co/downloads/fixpack/support-fixpack-310.zip
+- md5sum: c89d42b90bc67db8f604c4e783a14bbc
 
 ## support fixpack 300
 - Download: https://s3.bigstack.co/downloads/fixpack/support-fixpack-300.zip
