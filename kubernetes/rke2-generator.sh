@@ -501,7 +501,20 @@ parameters:
   csi.storage.k8s.io/node-publish-secret-namespace: kube-system
 CC
 
+edit_cluster="${dst_dir}/03-edit-cluster.yaml"
+cat > "$edit_cluster" <<CCEY
+    machineSelectorConfig:
+      - config: 
+          disable-cloud-controller: true
+          kubelet-arg:
+            - cloud-provider=external
+          protect-kernel-defaults: false
+CCEY
+
+cubectl node -r control rsync rke2-config
+
 echo
 echo "Config files written:"
 echo "- $outfile"
 echo "- $additional_manifest"
+echo "- $edit_cluster"
