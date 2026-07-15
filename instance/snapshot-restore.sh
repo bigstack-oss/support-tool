@@ -121,7 +121,7 @@ echo "Using domain: $domain_name ($domain_id)"
 echo
 echo "Select Project in domain '$domain_name':"
 projects_json="$(openstack project list --domain "$domain_id" -f json)"
-projects_json="$(echo "$projects_json" | jq '[.[] | select(.Name != "admin" and .Name != "_diagnostics" and .Name != "service")]')"
+projects_json="$(echo "$projects_json" | jq '[.[] | select(.Name != "_diagnostics" and .Name != "service")]')"
 
 project_count="$(echo "$projects_json" | jq 'length')"
 if (( project_count == 0 )); then
