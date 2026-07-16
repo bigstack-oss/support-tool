@@ -47,6 +47,6 @@ for ID in $DOWN_OSDS; do
 done
 
 # Show the final status
-echo "=== Final OSD Status in 10 seconds ==="
-sleep 10
+echo "=== Final OSD Status in 20 seconds (ceph osd df) ==="
+sleep 20
 ceph osd df
