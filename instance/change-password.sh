@@ -216,13 +216,32 @@ log "Compute host: $COMPUTE_HOST, instance: $INSTANCE_NAME, user: $VM_USER"
 
 # We never echo the password to logs or stdout.
 set +o xtrace
+
+log "Checking if QEMU Guest Agent is active on $INSTANCE_NAME..."
+
+# Step 1: Run guest-ping to verify the agent is alive
+PING_RESULT=$(ssh $SSH_OPTS "${SSH_USER}@${COMPUTE_HOST}" \
+  "sudo virsh qemu-agent-command '$INSTANCE_NAME' '{\"execute\":\"guest-ping\"}'" 2>>"$LOG_FILE")
+PING_RC=$?
+
+# A successful ping returns {"return":{}}
+if (( PING_RC == 0 )) && grep -q '"return"' <<<"$PING_RESULT"; then
+  log "qemu-guest-agent is installed, processing password change."
+else
+  log "ERROR: This VM ($INSTANCE_NAME) does not have an active QEMU guest agent, or the agent is unresponsive."
+  log "Please verify that the qemu-guest-agent service is running inside the guest OS."
+  exit 1
+fi
+
+# Step 2: Proceed with the password change since the agent is confirmed active
+log "Applying password change..."
 ssh $SSH_OPTS "${SSH_USER}@${COMPUTE_HOST}" \
-  sudo virsh set-user-password --domain "$INSTANCE_NAME" --user "$VM_USER" --password "$VM_PASS"
+  "sudo virsh set-user-password --domain '$INSTANCE_NAME' --user '$VM_USER' --password '$VM_PASS'"
 RC=$?
 
 if (( RC == 0 )); then
   log "SUCCESS: Password updated for user '$VM_USER' on instance '$INSTANCE_NAME' via host '$COMPUTE_HOST'."
 else
-  log "ERROR: virsh set-user-password failed with exit code $RC. Check guest-agent status and permissions on $COMPUTE_HOST."
+  log "ERROR: virsh set-user-password failed with exit code $RC despite active guest agent."
   exit $RC
 fi
