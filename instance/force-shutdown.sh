@@ -12,37 +12,6 @@ log() { echo "[$(TS)] $*" | tee -a "$LOG_FILE" >&2; }
 # Edit the path as needed; non-fatal if missing.
 [ -f /etc/admin-openrc.sh ] && . /etc/admin-openrc.sh || true
 
-pick_from_list() {
-  # Reads "name|id" lines from stdin, presents a numbered menu, and echoes the chosen id.
-  # Auto-selects if only one option.
-  mapfile -t ITEMS < <(grep -v '^[[:space:]]*$' || true)
-  local count=${#ITEMS[@]}
-  if (( count == 0 )); then
-    log "ERROR: No selectable items found."
-    return 1
-  elif (( count == 1 )); then
-    local name="${ITEMS[0]%%|*}"; local id="${ITEMS[0]#*|}"
-    echo "$id"
-    log "Auto-selected: ${name} ($id)"
-    return 0
-  else
-    local i=1
-    for line in "${ITEMS[@]}"; do
-      local name="${line%%|*}"; local id="${line#*|}"
-      echo "$i. ${name} (${id})"
-      ((i++))
-    done
-    while true; do
-      read -r -p "Enter a number [1-$count]: " sel
-      [[ "$sel" =~ ^[0-9]+$ ]] || { echo "Please enter a valid number."; continue; }
-      (( sel>=1 && sel<=count )) || { echo "Please choose between 1 and $count."; continue; }
-      local chosen="${ITEMS[sel-1]}"
-      echo "${chosen#*|}"
-      return 0
-    done
-  fi
-}
-
 # --- STEP 1: LIST DOMAINS (EXCLUDE 'HEAT') & SELECT (AUTO-PICK IF SINGLE) ----
 echo
 echo "Select Domain:"
@@ -105,58 +74,95 @@ while :; do
 done
 echo "Using project: $PROJECT_NAME ($PROJECT_ID)"
 
-# --- STEP 3: LIST SERVERS IN PROJECT & SELECT --------------------------------
+# --- STEP 3: LIST ALL SERVERS IN PROJECT & SELECT ---
 echo
 echo "Select Server in project '$PROJECT_NAME':"
 SERVERS_JSON=$(openstack server list --project "$PROJECT_ID" -f json)
 
 SERV_COUNT=$(echo "$SERVERS_JSON" | jq 'length')
 if (( SERV_COUNT == 0 )); then
-  echo "No servers found in project '$PROJECT_NAME'."; exit 1
+  echo "No servers found in project '$PROJECT_NAME'."; exit 0
 fi
 
-# Build "ID|Name|Status" lines and present a numbered list
-i=1
+# Build "ID|Name|Status" lines
 mapfile -t SERVER_LINES < <(echo "$SERVERS_JSON" | jq -r '.[] | "\(.ID)|\(.Name)|\(.Status)"')
+
+# Output numbered server list
+i=1
 for LINE in "${SERVER_LINES[@]}"; do
   IFS='|' read -r SRV_ID SRV_NAME SRV_STATUS <<< "$LINE"
   printf "%2d. %s (%s) - %s\n" "$i" "$SRV_NAME" "$SRV_ID" "$SRV_STATUS"
   ((i++))
 done
 
+# ALL SERVERS option as the last entry
+ALL_IDX=$((SERV_COUNT + 1))
+printf "%2d. ALL SERVERS (Process all %d servers)\n" "$ALL_IDX" "$SERV_COUNT"
+
 # Prompt until a valid number is chosen
+TARGET_SERVERS=()
 while :; do
-  read -rp "Enter server number: " SRV_IDX
-  if [[ "$SRV_IDX" =~ ^[0-9]+$ ]] && (( SRV_IDX >= 1 && SRV_IDX <= ${#SERVER_LINES[@]} )); then
-    IFS='|' read -r SERVER_ID SERVER_NAME <<< "${SERVER_LINES[$((SRV_IDX-1))]}"
-    break
+  read -rp "Enter server number [1-$ALL_IDX]: " SRV_IDX
+  if [[ "$SRV_IDX" =~ ^[0-9]+$ ]]; then
+    if (( SRV_IDX == ALL_IDX )); then
+      TARGET_SERVERS=("${SERVER_LINES[@]}")
+      echo "Selected: ALL servers"
+      break
+    elif (( SRV_IDX >= 1 && SRV_IDX <= SERV_COUNT )); then
+      TARGET_SERVERS=("${SERVER_LINES[$((SRV_IDX-1))]}")
+      IFS='|' read -r S_ID S_NAME _ <<< "${TARGET_SERVERS[0]}"
+      echo "Target server: $S_NAME ($S_ID)"
+      break
+    fi
   fi
   echo "Invalid selection."
 done
-echo "Target server: $SERVER_NAME ($SERVER_ID)"
 
-log "Fetching server details for $SERVER_ID ..."
-SERVER_SHOW=$(openstack server show "$SERVER_ID" -f json 2>>"$LOG_FILE") || { log "ERROR: Failed to get server details."; exit 1; }
-
-INSTANCE_NAME=$(jq -r '."OS-EXT-SRV-ATTR:instance_name"' <<<"$SERVER_SHOW")
-COMPUTE_HOST=$(jq -r '."OS-EXT-SRV-ATTR:host"' <<<"$SERVER_SHOW")
-
-if [[ -z "$INSTANCE_NAME" || "$INSTANCE_NAME" == "null" ]]; then
-  log "ERROR: Could not determine instance_name from server details."
-  exit 1
-fi
-if [[ -z "$COMPUTE_HOST" || "$COMPUTE_HOST" == "null" ]]; then
-  log "ERROR: Could not determine compute host from server details."
-  exit 1
-fi
+# --- STEP 4: PROCESS SELECTED SERVER(S) ---
 SSH_USER="${SSH_USER:-root}" 
 SSH_OPTS=${SSH_OPTS:-"-o BatchMode=yes -o StrictHostKeyChecking=accept-new"}
-log "Forced shutdown of instance '$INSTANCE_NAME' on compute host '$COMPUTE_HOST' ..."
-ssh $SSH_OPTS "${SSH_USER}@${COMPUTE_HOST}" \
-  "virsh destroy '$INSTANCE_NAME'"
-RC=$?
 
-log "Updating database to reflect stopped state for server '$SERVER_ID' ..."
-mysql nova -e "UPDATE instances SET vm_state = 'stopped', power_state = 4, task_state = NULL WHERE uuid = '$SERVER_ID';"
+for ENTRY in "${TARGET_SERVERS[@]}"; do
+  IFS='|' read -r SERVER_ID SERVER_NAME SERVER_STATUS <<< "$ENTRY"
+  echo
+  log "------------------------------------------------------------"
+  
+  # Skip processing if the server status is SHUTOFF
+  if [[ "$SERVER_STATUS" == "SHUTOFF" ]]; then
+    log "Skipping server: $SERVER_NAME ($SERVER_ID) [Status is SHUTOFF]"
+    continue
+  fi
 
-openstack server show $SERVER_ID -c compute_host -c hostname -c status -c power_state -c task_state -c vm_state -f json
+  log "Processing server: $SERVER_NAME ($SERVER_ID) [Current Status: $SERVER_STATUS]"
+
+  SERVER_SHOW=$(openstack server show "$SERVER_ID" -f json 2>>"$LOG_FILE") || { 
+    log "ERROR: Failed to get server details for $SERVER_ID. Skipping."
+    continue
+  }
+
+  INSTANCE_NAME=$(jq -r '."OS-EXT-SRV-ATTR:instance_name"' <<<"$SERVER_SHOW")
+  COMPUTE_HOST=$(jq -r '."OS-EXT-SRV-ATTR:host"' <<<"$SERVER_SHOW")
+
+  if [[ -z "$INSTANCE_NAME" || "$INSTANCE_NAME" == "null" ]]; then
+    log "ERROR: Could not determine instance_name for $SERVER_NAME ($SERVER_ID). Skipping."
+    continue
+  fi
+  if [[ -z "$COMPUTE_HOST" || "$COMPUTE_HOST" == "null" ]]; then
+    log "ERROR: Could not determine compute host for $SERVER_NAME ($SERVER_ID). Skipping."
+    continue
+  fi
+
+  log "Forced shutdown of instance '$INSTANCE_NAME' on compute host '$COMPUTE_HOST' ..."
+  if ssh $SSH_OPTS "${SSH_USER}@${COMPUTE_HOST}" "virsh destroy '$INSTANCE_NAME'"; then
+    log "Successfully destroyed domain $INSTANCE_NAME on $COMPUTE_HOST."
+  else
+    log "WARNING: 'virsh destroy' exited with non-zero status. Proceeding with DB update."
+  fi
+
+  log "Updating database to reflect stopped state for server '$SERVER_ID' ..."
+  mysql nova -e "UPDATE instances SET vm_state = 'stopped', power_state = 4, task_state = NULL WHERE uuid = '$SERVER_ID';"
+
+  openstack server show "$SERVER_ID" -c compute_host -c hostname -c status -c power_state -c task_state -c vm_state -f json
+done
+
+log "All operations complete."
