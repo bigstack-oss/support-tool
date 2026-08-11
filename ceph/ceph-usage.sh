@@ -123,13 +123,13 @@ human_bytes() {
 
     printf '\nNON-EMPTY POOLS\n'
     printf '===============\n'
-    printf '%-45s %-12s %-12s %-12s %-10s %s\n' 'POOL' 'STORED' 'PHYSICAL' 'NODEGROUP' 'POLICY' 'OBJECTS'
+    printf '%-45s  %-14s  %-18s  %s\n' 'POOL' 'STORED' 'NODEGROUP' 'POLICY'
 
     jq -r '.pools[]
       | select((.stats.stored // 0) > 0 or (.stats.bytes_used // 0) > 0 or (.stats.percent_used // 0) > 0)
-      | [.name, (.stats.stored // 0), (.stats.bytes_used // 0), (.stats.objects // 0)] | @tsv
+      | [.name, (.stats.stored // 0)] | @tsv
     ' "$work_dir/df.json" |
-    while IFS=$'\t' read -r pool stored raw_used objects; do
+    while IFS=$'\t' read -r pool stored; do
         detail=$(jq -r --arg pool "$pool" '
           .[] | select(.pool_name == $pool)
           | [.type, (.size // "-"), .crush_rule, (.erasure_code_profile // "-")] | @tsv
@@ -141,8 +141,8 @@ human_bytes() {
         else
             policy="EC:${ec_profile}"
         fi
-        printf '%-45s %-12s %-12s %-12s %-10s %s\n' \
-            "$pool" "$(human_bytes "$stored")" "$(human_bytes "$raw_used")" "$nodegroup" "$policy" "$objects"
+        printf '%-45s  %-14s  %-18s  %s\n' \
+            "$pool" "$(human_bytes "$stored")" "$nodegroup" "$policy"
     done
 
     printf '\nCRUSH ROOT CAPACITY SUMMARY\n'

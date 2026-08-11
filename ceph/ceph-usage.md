@@ -58,19 +58,19 @@ glance-images                  28   default~hdd
 
 NON-EMPTY POOLS
 ===============
-POOL                                          STORED       PHYSICAL     NODEGROUP    POLICY     OBJECTS
-.rgw.root                                     1.30 KiB     1.30 KiB     default~hdd  replica-3  4
-default.rgw.log                               1.31 MiB     1.31 MiB     default~hdd  replica-3  214
-default.rgw.meta                              3.66 KiB     3.66 KiB     default~hdd  replica-3  17
-default.rgw.buckets.index                     1.32 MiB     1.32 MiB     default~hdd  replica-3  33
-cachepool                                     670.91 GiB   670.91 GiB   default~ssd  replica-2  337125
-cephfs_data                                   215.16 GiB   215.16 GiB   default~hdd  replica-3  56005
-cephfs_metadata                               258.79 MiB   258.79 MiB   default~ssd  replica-3  159
-ephemeral-vms                                 218.76 GiB   218.76 GiB   computessd~ssd replica-2  196300
-glance-images                                 375.54 GiB   375.54 GiB   default~hdd  replica-3  48185
-.mgr                                          203.31 MiB   203.31 MiB   default~hdd  replica-3  52
-default.rgw.buckets.data                      89.82 MiB    89.82 MiB    default      EC:ec-543099e2-3-2 4562
-manila-volumes                                158.13 MiB   158.13 MiB   computehdd   replica-3  17541
+POOL                                           STORED          NODEGROUP           POLICY
+.rgw.root                                      1.30 KiB        default~hdd         replica-3
+default.rgw.log                                1.31 MiB        default~hdd         replica-3
+default.rgw.meta                               3.66 KiB        default~hdd         replica-3
+default.rgw.buckets.index                      1.32 MiB        default~hdd         replica-3
+cachepool                                      671.84 GiB      default~ssd         replica-2
+cephfs_data                                    215.16 GiB      default~hdd         replica-3
+cephfs_metadata                                259.69 MiB      default~ssd         replica-3
+ephemeral-vms                                  219.75 GiB      computessd~ssd      replica-2
+glance-images                                  375.54 GiB      default~hdd         replica-3
+.mgr                                           203.31 MiB      default~hdd         replica-3
+default.rgw.buckets.data                       89.82 MiB       default             EC:ec-543099e2-3-2
+manila-volumes                                 332.11 MiB      computehdd          replica-3
 
 CRUSH ROOT CAPACITY SUMMARY
 ===========================
