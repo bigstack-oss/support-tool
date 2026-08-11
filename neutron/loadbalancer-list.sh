@@ -63,7 +63,7 @@ for i in "${!lb_ids[@]}"; do
 
     # VM data
     if [ -n "$compute_id" ]; then
-        vm_data=$(   "$compute_id" -c name -c image -c created -f value)
+        vm_data=$(openstack server show"$compute_id" -c name -c image -c created -f value)
         vm_create_date=$(echo "$vm_data" | awk 'NR==1')
         glance_image=$(echo "$vm_data" | awk 'NR==2')
         compute_name=$(echo "$vm_data" | awk 'NR==3')
