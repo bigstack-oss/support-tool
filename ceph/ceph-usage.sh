@@ -121,12 +121,11 @@ human_bytes() {
         printf '%-20s %12s   %s\n' "$pool" "$count" "$nodegroup"
     done
 
-    printf '\nNON-EMPTY POOLS\n'
-    printf '===============\n'
+    printf '\nALL POOLS\n'
+    printf '=========\n'
     printf '%-45s  %-14s  %-18s  %s\n' 'POOL' 'STORED' 'NODEGROUP' 'POLICY'
 
     jq -r '.pools[]
-      | select((.stats.stored // 0) > 0 or (.stats.bytes_used // 0) > 0 or (.stats.percent_used // 0) > 0)
       | [.name, (.stats.stored // 0)] | @tsv
     ' "$work_dir/df.json" |
     while IFS=$'\t' read -r pool stored; do
