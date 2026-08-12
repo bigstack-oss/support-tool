@@ -88,19 +88,13 @@ default.rgw.buckets.data                       89.82 MiB       default          
 manila-volumes                                 332.11 MiB      computehdd          replica-3
 default.rgw.buckets.non-ec                     0 B             default             replica-1
 
-CRUSH ROOT CAPACITY SUMMARY
-===========================
-- computehdd (total: 58.92 TiB, used: 11.27 GiB, available: 58.91 TiB, used: 0.02%)
-- default (total: 785.85 TiB, used: 2.77 TiB, available: 783.08 TiB, used: 0.35%)
-- computessd (total: 10.47 TiB, used: 370.72 GiB, available: 10.11 TiB, used: 3.46%)
-
 RAW USAGE RECONCILIATION
 ========================
-ROOT             TOTAL SIZE       RAW USED       RESERVED       METADATA    ACTUAL DATA      AVAILABLE  REPLICATE    THEORETICAL CEPH MAX AVAIL
-computehdd        58.92 TiB      11.27 GiB      11.11 GiB     936.27 MiB     158.13 MiB      58.91 TiB          3      19.64 TiB      18.65 TiB
-default          785.85 TiB       2.77 TiB       1.54 TiB       4.55 GiB       1.23 TiB     783.08 TiB          3     261.03 TiB     233.30 TiB
-computessd        10.47 TiB     370.72 GiB     151.96 GiB     965.67 MiB     218.76 GiB      10.11 TiB          2       5.05 TiB       4.56 TiB
-TOTAL            855.24 TiB       3.14 TiB       1.70 TiB       6.41 GiB       1.45 TiB     852.09 TiB          -     285.72 TiB     256.52 TiB
+ROOT             TOTAL SIZE       RAW USED       RESERVED       METADATA    ACTUAL DATA      AVAILABLE  REPLICATE    THEORETICAL CEPH MAX AVAIL    USED%
+computehdd        58.92 TiB      10.12 GiB       9.80 GiB       1.14 GiB     332.11 MiB      58.91 TiB          3      19.64 TiB      18.65 TiB    0.02%
+default          785.85 TiB       2.77 TiB       1.53 TiB       6.36 GiB       1.23 TiB     783.08 TiB          3     261.03 TiB     233.30 TiB    0.35%
+computessd        10.47 TiB     382.25 GiB     162.43 GiB      11.35 GiB     219.82 GiB      10.10 TiB          2       5.05 TiB       4.55 TiB    3.57%
+TOTAL            855.24 TiB       3.15 TiB       1.70 TiB      18.86 GiB       1.45 TiB     852.09 TiB          -     285.71 TiB     256.51 TiB    0.37%
 
 Formulas:
   RAW USED - RESERVED = ACTUAL DATA

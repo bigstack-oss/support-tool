@@ -144,30 +144,10 @@ human_bytes() {
             "$pool" "$(human_bytes "$stored")" "$nodegroup" "$policy"
     done
 
-    printf '\nCRUSH ROOT CAPACITY SUMMARY\n'
-    printf '===========================\n'
-    for root in computehdd default computessd; do
-        root_values=$(jq -r --arg root "$root" '
-          .nodes[] | select(.type == "root" and .name == $root)
-          | [(.kb * 1024), (.kb_used * 1024), (.kb_avail * 1024), (.utilization // 0)]
-          | @tsv
-        ' "$work_dir/osd-df-tree.json")
-
-        if [[ -z "$root_values" ]]; then
-            printf -- '- %s (not found)\n' "$root"
-            continue
-        fi
-
-        IFS=$'\t' read -r total_bytes used_bytes avail_bytes utilization <<<"$root_values"
-        printf -- '- %s (total: %s, used: %s, available: %s, used: %.2f%%)\n' \
-            "$root" "$(human_bytes "$total_bytes")" "$(human_bytes "$used_bytes")" \
-            "$(human_bytes "$avail_bytes")" "$utilization"
-    done
-
     printf '\nRAW USAGE RECONCILIATION\n'
     printf '========================\n'
-    printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s\n' \
-        'ROOT' 'TOTAL SIZE' 'RAW USED' 'RESERVED' 'METADATA' 'ACTUAL DATA' 'AVAILABLE' 'REPLICATE' 'THEORETICAL' 'CEPH MAX AVAIL'
+    printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s %8s\n' \
+        'ROOT' 'TOTAL SIZE' 'RAW USED' 'RESERVED' 'METADATA' 'ACTUAL DATA' 'AVAILABLE' 'REPLICATE' 'THEORETICAL' 'CEPH MAX AVAIL' 'USED%'
 
     total_size=0
     total_raw=0
@@ -182,16 +162,18 @@ human_bytes() {
         root_usage=$(jq -r --arg root "$root" '
           .nodes[] | select(.type == "root" and .name == $root)
           | [((.kb // 0) * 1024), ((.kb_used // 0) * 1024),
-             ((.kb_used_meta // 0) * 1024), ((.kb_avail // 0) * 1024)]
+             ((.kb_used_meta // 0) * 1024), ((.kb_avail // 0) * 1024),
+             (.utilization // 0)]
           | @tsv
         ' "$work_dir/osd-df-tree.json")
         if [[ -n "$root_usage" ]]; then
-            IFS=$'\t' read -r size_bytes raw_bytes metadata_bytes available_bytes <<<"$root_usage"
+            IFS=$'\t' read -r size_bytes raw_bytes metadata_bytes available_bytes utilization <<<"$root_usage"
         else
             size_bytes=0
             raw_bytes=0
             metadata_bytes=0
             available_bytes=0
+            utilization=0
         fi
 
         actual_bytes=0
@@ -233,12 +215,12 @@ human_bytes() {
         ' "$work_dir/df.json")
         [[ -n "$ceph_max_bytes" ]] || ceph_max_bytes=0
 
-        printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s\n' "$root" \
+        printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s %7.2f%%\n' "$root" \
             "$(human_bytes "$size_bytes")" "$(human_bytes "$raw_bytes")" \
             "$(human_bytes "$reserved_bytes")" "$(human_bytes "$metadata_bytes")" \
             "$(human_bytes "$actual_bytes")" \
             "$(human_bytes "$available_bytes")" "$replicate" \
-            "$(human_bytes "$theoretical_bytes")" "$(human_bytes "$ceph_max_bytes")"
+            "$(human_bytes "$theoretical_bytes")" "$(human_bytes "$ceph_max_bytes")" "$utilization"
 
         total_size=$(awk -v a="$total_size" -v b="$size_bytes" 'BEGIN { printf "%.0f", a+b }')
         total_raw=$(awk -v a="$total_raw" -v b="$raw_bytes" 'BEGIN { printf "%.0f", a+b }')
@@ -250,12 +232,15 @@ human_bytes() {
         total_ceph_max=$(awk -v a="$total_ceph_max" -v b="$ceph_max_bytes" 'BEGIN { printf "%.0f", a+b }')
     done
 
-    printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s\n' 'TOTAL' \
+    total_utilization=$(awk -v used="$total_raw" -v size="$total_size" '
+      BEGIN { if (size > 0) printf "%.2f", used*100/size; else print "0.00" }
+    ')
+    printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s %7.2f%%\n' 'TOTAL' \
         "$(human_bytes "$total_size")" "$(human_bytes "$total_raw")" \
         "$(human_bytes "$total_reserved")" "$(human_bytes "$total_metadata")" \
         "$(human_bytes "$total_actual")" \
         "$(human_bytes "$total_available")" '-' "$(human_bytes "$total_theoretical")" \
-        "$(human_bytes "$total_ceph_max")"
+        "$(human_bytes "$total_ceph_max")" "$total_utilization"
     printf '\nFormulas:\n'
     printf '  RAW USED - RESERVED = ACTUAL DATA\n'
     printf '  TOTAL SIZE - RAW USED = AVAILABLE\n'
