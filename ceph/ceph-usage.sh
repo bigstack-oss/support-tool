@@ -6,6 +6,25 @@
 set -u
 set -o pipefail
 
+# USER CONFIGURATION
+# ------------------
+# RBD pools whose image counts should be included in the report.
+RBD_POOLS=(
+    cinder-volumes
+    ephemeral-vms
+    glance-images
+)
+
+# Map each CRUSH root to one representative pool using that root.
+# The pool supplies REPLICATE and CEPH MAX AVAIL for the root summary.
+# Add, remove, or change entries to match this Ceph cluster.
+declare -A REFERENCE_POOL_BY_ROOT=(
+    [default]=cinder-volumes
+    # [FileStoreHDD]=pool-name
+    # [DataStoreHDD]=pool-name
+    # [DataStoreSSD]=pool-name
+)
+
 timestamp=$(date '+%Y%m%d-%H%M%S')
 report=${1:-"ceph-storage-summary-${timestamp}.txt"}
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ceph-storage.XXXXXXXX")
@@ -32,6 +51,18 @@ run_json "$work_dir/osd-df-tree.json"    ceph osd df tree
 run_json "$work_dir/pools.json"          ceph osd pool ls detail
 run_json "$work_dir/df.json"             ceph df
 run_json "$work_dir/crush-rules.json"    ceph osd crush rule dump
+
+# Discover physical CRUSH roots dynamically. Shadow roots such as
+# default~hdd are excluded because they duplicate the physical hierarchy.
+mapfile -t CRUSH_ROOTS < <(
+    jq -r '.nodes[] | select(.type == "root" and (.name | contains("~") | not)) | .name' \
+        "$work_dir/osd-tree.json"
+)
+
+if (( ${#CRUSH_ROOTS[@]} == 0 )); then
+    printf 'ERROR: no CRUSH roots found in ceph osd tree output.\n' >&2
+    exit 1
+fi
 
 root_for_rule() {
     rule_id=$1
@@ -74,7 +105,7 @@ human_bytes() {
     printf 'CRUSH ROOT LAYOUT\n'
     printf '=================\n'
 
-    for root in default computessd computehdd; do
+    for root in "${CRUSH_ROOTS[@]}"; do
         root_id=$(jq -r --arg root "$root" '.nodes[] | select(.type == "root" and .name == $root) | .id' "$work_dir/osd-tree.json")
         if [[ -z "$root_id" ]]; then
             printf '%s: not found\n\n' "$root"
@@ -104,7 +135,7 @@ human_bytes() {
     printf '========================\n'
     printf '%-20s %12s   %s\n' 'POOL' 'IMAGE COUNT' 'NODEGROUP'
 
-    for pool in cinder-volumes ephemeral-vms manila-volumes glance-images; do
+    for pool in "${RBD_POOLS[@]}"; do
         if ! rbd ls "$pool" >"$work_dir/rbd-${pool}.txt"; then
             printf '%-20s %12s   %s\n' "$pool" 'ERROR' 'unknown'
             continue
@@ -146,7 +177,7 @@ human_bytes() {
 
     printf '\nRAW USAGE RECONCILIATION\n'
     printf '========================\n'
-    printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s %8s\n' \
+    printf '%-18s %14s %14s %14s %14s %14s %14s %10s %14s %14s %8s\n' \
         'ROOT' 'TOTAL SIZE' 'RAW USED' 'RESERVED' 'METADATA' 'ACTUAL DATA' 'AVAILABLE' 'REPLICATE' 'THEORETICAL' 'CEPH MAX AVAIL' 'USED%'
 
     total_size=0
@@ -158,7 +189,7 @@ human_bytes() {
     total_theoretical=0
     total_ceph_max=0
 
-    for root in computehdd default computessd; do
+    for root in "${CRUSH_ROOTS[@]}"; do
         root_usage=$(jq -r --arg root "$root" '
           .nodes[] | select(.type == "root" and .name == $root)
           | [((.kb // 0) * 1024), ((.kb_used // 0) * 1024),
@@ -194,33 +225,37 @@ human_bytes() {
           BEGIN { difference=raw-actual; if (difference < 0) difference=0; printf "%.0f", difference }
         ')
 
-        case "$root" in
-            default)    reference_pool=cinder-volumes ;;
-            computessd) reference_pool=ephemeral-vms ;;
-            computehdd) reference_pool=manila-volumes ;;
-        esac
-        replicate=$(jq -r --arg pool "$reference_pool" '
-          .[] | select(.pool_name == $pool) | (.size // "-")
-        ' "$work_dir/pools.json")
-        [[ -n "$replicate" ]] || replicate='-'
+        reference_pool=${REFERENCE_POOL_BY_ROOT[$root]-}
+        if [[ -n "$reference_pool" ]]; then
+            replicate=$(jq -r --arg pool "$reference_pool" '
+              first(.[] | select(.pool_name == $pool) | (.size // "-")) // "-"
+            ' "$work_dir/pools.json")
+            ceph_max_bytes=$(jq -r --arg pool "$reference_pool" '
+              first(.pools[] | select(.name == $pool) | (.stats.max_avail // 0)) // 0
+            ' "$work_dir/df.json")
+        else
+            replicate='-'
+            ceph_max_bytes=0
+        fi
         if [[ "$replicate" =~ ^[1-9][0-9]*$ ]]; then
             theoretical_bytes=$(awk -v available="$available_bytes" -v copies="$replicate" '
               BEGIN { printf "%.0f", available/copies }
             ')
+            theoretical_display=$(human_bytes "$theoretical_bytes")
+            ceph_max_display=$(human_bytes "$ceph_max_bytes")
         else
             theoretical_bytes=0
+            theoretical_display='-'
+            ceph_max_display='-'
         fi
-        ceph_max_bytes=$(jq -r --arg pool "$reference_pool" '
-          .pools[] | select(.name == $pool) | (.stats.max_avail // 0)
-        ' "$work_dir/df.json")
         [[ -n "$ceph_max_bytes" ]] || ceph_max_bytes=0
 
-        printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s %7.2f%%\n' "$root" \
+        printf '%-18s %14s %14s %14s %14s %14s %14s %10s %14s %14s %7.2f%%\n' "$root" \
             "$(human_bytes "$size_bytes")" "$(human_bytes "$raw_bytes")" \
             "$(human_bytes "$reserved_bytes")" "$(human_bytes "$metadata_bytes")" \
             "$(human_bytes "$actual_bytes")" \
             "$(human_bytes "$available_bytes")" "$replicate" \
-            "$(human_bytes "$theoretical_bytes")" "$(human_bytes "$ceph_max_bytes")" "$utilization"
+            "$theoretical_display" "$ceph_max_display" "$utilization"
 
         total_size=$(awk -v a="$total_size" -v b="$size_bytes" 'BEGIN { printf "%.0f", a+b }')
         total_raw=$(awk -v a="$total_raw" -v b="$raw_bytes" 'BEGIN { printf "%.0f", a+b }')
@@ -235,7 +270,7 @@ human_bytes() {
     total_utilization=$(awk -v used="$total_raw" -v size="$total_size" '
       BEGIN { if (size > 0) printf "%.2f", used*100/size; else print "0.00" }
     ')
-    printf '%-12s %14s %14s %14s %14s %14s %14s %10s %14s %14s %7.2f%%\n' 'TOTAL' \
+    printf '%-18s %14s %14s %14s %14s %14s %14s %10s %14s %14s %7.2f%%\n' 'TOTAL' \
         "$(human_bytes "$total_size")" "$(human_bytes "$total_raw")" \
         "$(human_bytes "$total_reserved")" "$(human_bytes "$total_metadata")" \
         "$(human_bytes "$total_actual")" \
