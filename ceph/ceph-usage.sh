@@ -199,6 +199,74 @@ human_bytes() {
             "$pool" "$(human_bytes "$stored")" "$nodegroup" "$policy"
     done
 
+    printf '\nDEVICE-CLASS RAW USAGE\n'
+    printf '======================\n'
+    printf '%-20s %-12s %14s %14s %14s %8s\n' \
+        'ROOT' 'CLASS' 'TOTAL SIZE' 'RAW USED' 'AVAILABLE' 'USED%'
+
+    class_total_size=0
+    class_total_raw=0
+    class_total_available=0
+    class_rows=0
+    for root in "${CRUSH_ROOTS[@]}"; do
+        # Sum the OSD counters directly, grouped by their CRUSH device class.
+        # Some Ceph versions do not include capacity counters on shadow roots
+        # (for example default~ssd), so using the OSD rows is more portable.
+        while IFS=$'\t' read -r device_class size_bytes raw_bytes available_bytes utilization; do
+            [[ -n "$device_class" ]] || continue
+            printf '%-20s %-12s %14s %14s %14s %7.2f%%\n' "$root" \
+                "${device_class^^}" "$(human_bytes "$size_bytes")" \
+                "$(human_bytes "$raw_bytes")" "$(human_bytes "$available_bytes")" \
+                "$utilization"
+            class_total_size=$(awk -v a="$class_total_size" -v b="$size_bytes" 'BEGIN { printf "%.0f", a+b }')
+            class_total_raw=$(awk -v a="$class_total_raw" -v b="$raw_bytes" 'BEGIN { printf "%.0f", a+b }')
+            class_total_available=$(awk -v a="$class_total_available" -v b="$available_bytes" 'BEGIN { printf "%.0f", a+b }')
+            class_rows=$((class_rows + 1))
+        done < <(jq -r --slurpfile tree "$work_dir/osd-tree.json" --arg root "$root" '
+          .nodes as $df_nodes
+          | $tree[0].nodes as $tree_nodes
+          | ($tree_nodes[]
+             | select(.type == "root" and .name == $root)
+             | .id) as $root_id
+          | [ $tree_nodes[]
+              | select(.type == "host" and ((.id) as $host_id
+                  | any($tree_nodes[];
+                      .id == $root_id and ((.children // []) | index($host_id)))))
+              | .children[] as $osd_id
+              | ($tree_nodes[] | select(.id == $osd_id and .type == "osd")) as $osd
+              | ($df_nodes[] | select(.id == $osd_id)) as $usage
+              | {
+                  device_class: ($osd.device_class // "unknown"),
+                  size: (($usage.kb // 0) * 1024),
+                  raw: (($usage.kb_used // 0) * 1024),
+                  available: (($usage.kb_avail // 0) * 1024)
+                }
+            ]
+          | group_by(.device_class)
+          | .[]
+          | [
+              .[0].device_class,
+              (map(.size) | add),
+              (map(.raw) | add),
+              (map(.available) | add)
+            ] as $row
+          | ($row[2] * 100 / $row[1]) as $utilization
+          | [$row[0], $row[1], $row[2], $row[3], $utilization]
+          | @tsv
+        ' "$work_dir/osd-df-tree.json")
+    done
+
+    if (( class_rows == 0 )); then
+        printf '%-20s %-12s %14s %14s %14s %8s\n' '-' '-' '-' '-' '-' '-'
+    else
+        class_total_utilization=$(awk -v used="$class_total_raw" -v size="$class_total_size" '
+          BEGIN { if (size > 0) printf "%.2f", used*100/size; else print "0.00" }
+        ')
+        printf '%-20s %-12s %14s %14s %14s %7.2f%%\n' 'TOTAL (all classes)' '-' \
+            "$(human_bytes "$class_total_size")" "$(human_bytes "$class_total_raw")" \
+            "$(human_bytes "$class_total_available")" "$class_total_utilization"
+    fi
+
     printf '\nRAW USAGE RECONCILIATION\n'
     printf '========================\n'
     printf '%-18s %14s %14s %14s %14s %14s %14s %10s %14s %14s %8s\n' \
