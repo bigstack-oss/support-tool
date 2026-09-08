@@ -13,6 +13,9 @@ RBD_POOLS=(
     cinder-volumes
     ephemeral-vms
     glance-images
+    # manila-volumes
+    # smarthealth-volumes
+    # smarthealth-ephemeral-vms
 )
 
 # Map each CRUSH root to one representative pool using that root.
@@ -20,15 +23,28 @@ RBD_POOLS=(
 # Add, remove, or change entries to match this Ceph cluster.
 declare -A REFERENCE_POOL_BY_ROOT=(
     [default]=cinder-volumes
-    # [FileStoreHDD]=pool-name
-    # [DataStoreHDD]=pool-name
-    # [DataStoreSSD]=pool-name
+    # [computehdd]=manila-volumes
+    # [computessd]=ephemeral-vms
+    # [smarthealth]=smarthealth-volumes
 )
 
 timestamp=$(date '+%Y%m%d-%H%M%S')
-report=${1:-"ceph-storage-summary-${timestamp}.txt"}
+report_dir=/var/log/ceph
+report=${1:-"${report_dir}/ceph-storage-summary-${timestamp}.txt"}
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ceph-storage.XXXXXXXX")
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
+
+if ! mkdir -p "$(dirname "$report")"; then
+    printf 'ERROR: cannot create report directory: %s\n' "$(dirname "$report")" >&2
+    printf 'Run as root or provide a writable output path as the first argument.\n' >&2
+    exit 1
+fi
+
+if ! : >"$report"; then
+    printf 'ERROR: cannot write report: %s\n' "$report" >&2
+    printf 'Run as root or provide a writable output path as the first argument.\n' >&2
+    exit 1
+fi
 
 for command_name in ceph rbd jq; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -78,6 +94,14 @@ parent_root_for_rule() {
     # Device-class shadow roots are named root~class (for example,
     # default~hdd). Their physical usage belongs to the parent root.
     printf '%s\n' "${rule_target%%~*}"
+}
+
+reference_pool_for_root() {
+    local wanted_root=$1
+    local pool=${REFERENCE_POOL_BY_ROOT[$wanted_root]:-}
+
+    [[ -n "$pool" ]] || return 1
+    printf '%s\n' "$pool"
 }
 
 pool_field() {
@@ -225,7 +249,7 @@ human_bytes() {
           BEGIN { difference=raw-actual; if (difference < 0) difference=0; printf "%.0f", difference }
         ')
 
-        reference_pool=${REFERENCE_POOL_BY_ROOT[$root]-}
+        reference_pool=$(reference_pool_for_root "$root" || true)
         if [[ -n "$reference_pool" ]]; then
             replicate=$(jq -r --arg pool "$reference_pool" '
               first(.[] | select(.pool_name == $pool) | (.size // "-")) // "-"
@@ -283,6 +307,6 @@ human_bytes() {
     printf 'Reserved is raw OSD usage not attributed to pools by bytes_used.\n'
     printf 'METADATA is Ceph-reported OSD metadata and is included within RESERVED.\n'
     printf 'CEPH MAX AVAIL is the representative backend pool max_avail from ceph df.\n'
-} >"$report"
+} | tee "$report"
 
 printf 'Report written to: %s\n' "$report"
