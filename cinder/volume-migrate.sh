@@ -33,37 +33,87 @@ require_openstack_auth() {
     [[ -n ${OS_AUTH_URL:-} ]] || fail 'OS_AUTH_URL is unset. Source the OpenStack admin RC file first.'
 }
 
+choose_domain() {
+    local domains selection
+    domains=$(openstack domain list -f json) || fail 'Cannot list OpenStack domains.'
+    domains=$(jq '[.[] | select(.Name != "heat")]' <<<"$domains") || fail 'Cannot filter OpenStack domains.'
+    mapfile -t DOMAIN_IDS < <(jq -r '.[].ID' <<<"$domains")
+    mapfile -t DOMAIN_NAMES < <(jq -r '.[].Name' <<<"$domains")
+    ((${#DOMAIN_IDS[@]})) || fail 'No domain found.'
+
+    if ((${#DOMAIN_IDS[@]} == 1)); then
+        selection=1
+        log 'Only one domain available; selecting it automatically.'
+    else
+        printf 'Available domains:\n'
+        local i
+        for i in "${!DOMAIN_IDS[@]}"; do
+            printf '%d. %s (%s)\n' "$((i + 1))" "${DOMAIN_NAMES[$i]}" "${DOMAIN_IDS[$i]}"
+        done
+        read -r -p 'Select domain number: ' selection
+        [[ $selection =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#DOMAIN_IDS[@]})) || fail 'Invalid domain selection.'
+    fi
+    SELECTED_DOMAIN_ID=${DOMAIN_IDS[$((selection - 1))]}
+    log "Domain → ${DOMAIN_NAMES[$((selection - 1))]} ($SELECTED_DOMAIN_ID)"
+}
+
 choose_project() {
     local projects selection
-    projects=$(openstack project list -f json) || fail 'Cannot list OpenStack projects.'
+    projects=$(openstack project list --domain "$SELECTED_DOMAIN_ID" -f json) || fail 'Cannot list OpenStack projects.'
+    projects=$(jq '[.[] | select(.Name != "service")]' <<<"$projects") || fail 'Cannot filter OpenStack projects.'
     mapfile -t PROJECT_IDS < <(jq -r '.[].ID' <<<"$projects")
     mapfile -t PROJECT_NAMES < <(jq -r '.[].Name' <<<"$projects")
     ((${#PROJECT_IDS[@]})) || fail 'No project found.'
 
-    printf 'Available projects:\n'
-    local i
-    for i in "${!PROJECT_IDS[@]}"; do
-        printf '%d. %s (%s)\n' "$((i + 1))" "${PROJECT_NAMES[$i]}" "${PROJECT_IDS[$i]}"
-    done
-    read -r -p 'Select project number: ' selection
-    [[ $selection =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#PROJECT_IDS[@]})) || fail 'Invalid project selection.'
-    export OS_PROJECT_NAME=${PROJECT_NAMES[$((selection - 1))]}
+    if ((${#PROJECT_IDS[@]} == 1)); then
+        selection=1
+        log 'Only one project available; selecting it automatically.'
+    else
+        printf 'Available projects:\n'
+        local i
+        for i in "${!PROJECT_IDS[@]}"; do
+            printf '%d. %s (%s)\n' "$((i + 1))" "${PROJECT_NAMES[$i]}" "${PROJECT_IDS[$i]}"
+        done
+        read -r -p 'Select project number: ' selection
+        [[ $selection =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#PROJECT_IDS[@]})) || fail 'Invalid project selection.'
+    fi
+    OS_PROJECT_DOMAIN_ID=$SELECTED_DOMAIN_ID
+    unset OS_PROJECT_DOMAIN_NAME
+    export OS_PROJECT_DOMAIN_ID OS_PROJECT_NAME=${PROJECT_NAMES[$((selection - 1))]}
     log "Project → $OS_PROJECT_NAME (${PROJECT_IDS[$((selection - 1))]})"
 }
 
 choose_pool() {
-    local pools selection
+    local pools selection pool primary_pool=''
+    local -a remaining_pools=()
     pools=$(cinder get-pools 2>/dev/null | awk -F'|' '/\|/ && $2 ~ /name/ {gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 != "") print $3}')
     [[ -n $pools ]] || fail 'No Cinder pools returned by cinder get-pools.'
     mapfile -t POOLS < <(printf '%s\n' "$pools")
-
-    printf 'Available Cinder pools:\n'
-    local i
-    for i in "${!POOLS[@]}"; do
-        printf '%d. %s\n' "$((i + 1))" "${POOLS[$i]}"
+    for pool in "${POOLS[@]}"; do
+        if [[ $pool == cube@ceph#ceph ]]; then
+            primary_pool=$pool
+        else
+            remaining_pools+=("$pool")
+        fi
     done
-    read -r -p 'Select pool number: ' selection
-    [[ $selection =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#POOLS[@]})) || fail 'Invalid pool selection.'
+    if [[ -n $primary_pool ]]; then
+        POOLS=("$primary_pool" "${remaining_pools[@]}")
+    else
+        POOLS=("${remaining_pools[@]}")
+    fi
+
+    if ((${#POOLS[@]} == 1)); then
+        selection=1
+        log 'Only one Cinder pool available; selecting it automatically.'
+    else
+        printf 'Available Cinder pools:\n'
+        local i
+        for i in "${!POOLS[@]}"; do
+            printf '%d. %s\n' "$((i + 1))" "${POOLS[$i]}"
+        done
+        read -r -p 'Select pool number: ' selection
+        [[ $selection =~ ^[0-9]+$ ]] && ((selection >= 1 && selection <= ${#POOLS[@]})) || fail 'Invalid pool selection.'
+    fi
     POOL=${POOLS[$((selection - 1))]}
     log "Pool → $POOL"
 }
@@ -322,6 +372,7 @@ main() {
     require_openstack_auth
     load_sources "$requested_source"
 
+    choose_domain
     choose_project
     choose_pool
     set_backend
