@@ -4,7 +4,9 @@
 set -euo pipefail
 
 LOGFILE=/var/log/support-volume-migrate.log
+GLANCE_DIR=/mnt/cephfs/glance
 DEFAULT_OUTDIR=/mnt/cephfs/glance/output
+MANAGE_WAIT_SECONDS=300
 
 log()  { local now; now=$(date '+%F %T'); printf '\033[32m[INFO]\033[0m  %s %s\n' "$now" "$*"; printf '%s [INFO] %s\n' "$now" "$*" >>"$LOGFILE" 2>/dev/null || true; }
 warn() { local now; now=$(date '+%F %T'); printf '\033[33m[WARN]\033[0m  %s %s\n' "$now" "$*" >&2; printf '%s [WARN] %s\n' "$now" "$*" >>"$LOGFILE" 2>/dev/null || true; }
@@ -12,7 +14,11 @@ fail() { local now; now=$(date '+%F %T'); printf '\033[31m[ERROR]\033[0m %s %s\n
 
 usage() {
     cat <<'EOF'
-Usage: volume-migrate-by-codex.sh <disk-image> [<NFS-staging-directory>]
+Usage: volume-migrate-by-codex.sh <disk-image-or-list.txt> [<NFS-staging-directory>]
+
+For a .txt list, put one image filename per line.  Each filename is resolved
+under /mnt/cephfs/glance; blank lines and lines beginning with # are ignored.
+The selected project, Cinder pool, and migration mode apply to every image.
 
 The NetApp-NFS route automatically maps the selected Cinder pool to its local
 mount.  The optional second argument is only for an explicit subdirectory on
@@ -66,18 +72,55 @@ set_backend() {
     if [[ $POOL == *netapp-nfs* ]]; then
         BACKEND=nfs
         VOL_TYPE=netapp-nfs
-    elif [[ $POOL == *cinder-volumes-ssd* ]]; then
+    elif [[ $POOL == cube@*#* ]]; then
         BACKEND=rbd
-        VOL_POOL=cinder-volumes-ssd
-        VOL_TYPE=CubeStorage-ssd
-    elif [[ $POOL == *ceph* || $POOL == *cinder-volumes* ]]; then
-        BACKEND=rbd
-        VOL_POOL=cinder-volumes
-        VOL_TYPE=CubeStorage
+        # Cube backends normally expose their Ceph pool after '#'.  The legacy
+        # primary Cube backend is the exception: cube@ceph#ceph uses the
+        # cinder-volumes RBD pool.
+        VOL_POOL=${POOL#*#}
+        [[ -n $VOL_POOL && $VOL_POOL != "$POOL" ]] || fail "Selected Cube pool '$POOL' has no Ceph pool suffix."
+        [[ $POOL == cube@ceph#ceph ]] && VOL_POOL=cinder-volumes
+        set_cube_volume_type
     else
         fail "Unsupported pool '$POOL'. This script supports NetApp NFS and CubeStorage RBD only."
     fi
-    log "Backend → $BACKEND; volume type → $VOL_TYPE"
+    if [[ $BACKEND == rbd ]]; then
+        log "Backend → $BACKEND; Ceph pool → $VOL_POOL; volume type → $VOL_TYPE"
+    else
+        log "Backend → $BACKEND; volume type → $VOL_TYPE"
+    fi
+}
+
+set_cube_volume_type() {
+    local types type_name type_key type_key_lower candidate candidate_lower
+    local -a matches=()
+
+    # The primary Cube backend is intentionally mapped to its established type.
+    if [[ $POOL == cube@ceph#ceph ]]; then
+        VOL_TYPE=CubeStorage
+        return
+    fi
+
+    # Derive the type from the selected Ceph-pool suffix, not extra specs:
+    # #manila-volumes -> CubeStorage-Manila and
+    # #smarthealth-volumes -> CubeStorage-smarthealth.
+    type_key=${VOL_POOL%-volumes}
+    [[ -n $type_key ]] || fail "Cannot derive a CubeStorage volume type from Ceph pool '$VOL_POOL'."
+    type_key_lower=$(tr '[:upper:]' '[:lower:]' <<<"$type_key")
+    types=$(openstack volume type list -f json) || fail 'Cannot list Cinder volume types.'
+    while IFS= read -r type_name; do
+        candidate=${type_name#CubeStorage-}
+        candidate_lower=$(tr '[:upper:]' '[:lower:]' <<<"$candidate")
+        if [[ $candidate != "$type_name" && $candidate_lower == "$type_key_lower" ]]; then
+            matches+=("$type_name")
+        fi
+    done < <(jq -r '.[].Name' <<<"$types")
+
+    case ${#matches[@]} in
+        1) VOL_TYPE=${matches[0]} ;;
+        0) fail "No CubeStorage volume type matches selected Ceph pool '$VOL_POOL' (expected CubeStorage-$type_key)." ;;
+        *) fail "Multiple CubeStorage volume types match selected Ceph pool '$VOL_POOL': ${matches[*]}." ;;
+    esac
 }
 
 choose_migration_type() {
@@ -195,40 +238,67 @@ manage_rbd_volume() {
     cinder manage --bootable --volume-type "$VOL_TYPE" --name "$VOL_NAME" "$POOL" "$rbd_name" || fail 'Cinder RBD manage failed.'
 }
 
-main() {
-    SRC_IMG=${1:-}
-    NFS_ARGUMENT=${2:-}
-    [[ -n $SRC_IMG ]] || { usage >&2; exit 2; }
-    [[ -f $SRC_IMG ]] || fail "File not found: $SRC_IMG"
-    mkdir -p "$(dirname "$LOGFILE")"; touch "$LOGFILE" 2>/dev/null || warn "Cannot write $LOGFILE"
-    require_openstack_auth
+wait_for_managed_volume() {
+    local volume_id=$1 status deadline
+    # `cinder manage` only queues an asynchronous request.  For RBD, the Cinder
+    # driver renames the source image to volume-<UUID> while processing it.
+    deadline=$(( $(date +%s) + MANAGE_WAIT_SECONDS ))
+    while :; do
+        status=$(openstack volume show "$volume_id" -f value -c status 2>/dev/null || true)
+        case $status in
+            available)
+                log "Managed volume is available."
+                return 0
+                ;;
+            error|error_managing)
+                fail "Cinder failed to manage volume $volume_id (status: $status). The source backend object was retained."
+                ;;
+        esac
+        (( $(date +%s) < deadline )) || fail "Timed out after ${MANAGE_WAIT_SECONDS}s waiting for Cinder to manage volume $volume_id (last status: ${status:-unknown})."
+        sleep 2
+    done
+}
 
+load_sources() {
+    local requested=$1 entry
+    SOURCE_IMAGES=()
+    if [[ $requested == *.txt ]]; then
+        [[ -f $requested ]] || fail "List file not found: $requested"
+        while IFS= read -r entry || [[ -n $entry ]]; do
+            entry=${entry%$'\r'}
+            [[ -z $entry || $entry == \#* ]] && continue
+            [[ $entry != */* && $entry != . && $entry != .. ]] || fail "List entry must be a filename under $GLANCE_DIR: $entry"
+            [[ -f $GLANCE_DIR/$entry ]] || fail "Listed image not found: $GLANCE_DIR/$entry"
+            SOURCE_IMAGES+=("$GLANCE_DIR/$entry")
+        done <"$requested"
+        ((${#SOURCE_IMAGES[@]})) || fail "No image filenames found in list: $requested"
+        log "Loaded ${#SOURCE_IMAGES[@]} image(s) from $requested."
+    else
+        [[ -f $requested ]] || fail "File not found: $requested"
+        SOURCE_IMAGES=("$requested")
+    fi
+}
+
+migrate_image() {
+    SRC_IMG=$1
     FILE_FORMAT=$(qemu-img info --output=json "$SRC_IMG" | jq -r '.format')
-    [[ $FILE_FORMAT != null && -n $FILE_FORMAT ]] || fail 'Cannot determine source image format.'
+    [[ $FILE_FORMAT != null && -n $FILE_FORMAT ]] || fail "Cannot determine source image format: $SRC_IMG"
     IMG_NAME=$(basename "$SRC_IMG")
     BASE_NAME=${IMG_NAME%.*}; [[ $BASE_NAME != "$IMG_NAME" ]] || BASE_NAME=$IMG_NAME
     EXTENSION=${IMG_NAME##*.}; [[ $EXTENSION != "$IMG_NAME" ]] || EXTENSION=''
     TS=$(date +%Y%m%d-%H%M%S)
+    if ((${#SOURCE_IMAGES[@]} > 1)); then TS+="-${MIGRATION_INDEX}"; fi
     log "Source: $SRC_IMG (format $FILE_FORMAT)"
-
-    choose_project
-    choose_pool
-    set_backend
-    choose_migration_type
 
     XML=''
     if [[ $BACKEND == nfs ]]; then
-        prepare_nfs_stage "$NFS_ARGUMENT"
         if [[ $MIGRATION_TYPE == disk ]]; then stage_disk_to_nfs "$BASE_NAME"; else run_v2v_to_dir "$NFS_STAGE"; fi
         detect_os "$STAGED_DISK"
         manage_nfs_volume
     else
-        if [[ $MIGRATION_TYPE == disk && $FILE_FORMAT != raw ]]; then
-            STAGED_DISK=$SRC_IMG
-        elif [[ $MIGRATION_TYPE == disk ]]; then
+        if [[ $MIGRATION_TYPE == disk ]]; then
             STAGED_DISK=$SRC_IMG
         else
-            mkdir -p "$DEFAULT_OUTDIR"
             run_v2v_to_dir "$DEFAULT_OUTDIR"
         fi
         detect_os "$STAGED_DISK"
@@ -236,10 +306,41 @@ main() {
     fi
 
     VOL_ID=$(openstack volume show "$VOL_NAME" -f value -c id) || fail 'Managed volume was created but could not be looked up.'
+    wait_for_managed_volume "$VOL_ID"
     set_common_metadata "$VOL_NAME"
     if [[ $BACKEND == rbd ]]; then rbd du "$VOL_POOL/volume-$VOL_ID" || warn 'rbd du failed.'; fi
     openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
     log "Migration completed: $VOL_NAME (ID: $VOL_ID)"
+}
+
+main() {
+    local requested_source image
+    requested_source=${1:-}
+    NFS_ARGUMENT=${2:-}
+    [[ -n $requested_source ]] || { usage >&2; exit 2; }
+    mkdir -p "$(dirname "$LOGFILE")"; touch "$LOGFILE" 2>/dev/null || warn "Cannot write $LOGFILE"
+    require_openstack_auth
+    load_sources "$requested_source"
+
+    choose_project
+    choose_pool
+    set_backend
+    choose_migration_type
+
+    if [[ $BACKEND == nfs ]]; then
+        prepare_nfs_stage "$NFS_ARGUMENT"
+    else
+        if [[ $MIGRATION_TYPE == v2v ]]; then
+            mkdir -p "$DEFAULT_OUTDIR"
+        fi
+    fi
+
+    MIGRATION_INDEX=0
+    for image in "${SOURCE_IMAGES[@]}"; do
+        ((MIGRATION_INDEX += 1))
+        migrate_image "$image"
+    done
+    log "All ${#SOURCE_IMAGES[@]} migration(s) completed."
 }
 
 main "$@"
