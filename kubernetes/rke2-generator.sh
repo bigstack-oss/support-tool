@@ -381,6 +381,16 @@ spec:
   valuesContent: |
     nodeSelector:
       node-role.kubernetes.io/control-plane: "true"
+    tolerations:
+      - key: node-role.kubernetes.io/etcd
+        operator: Exists
+        effect: NoExecute
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node.cloudprovider.kubernetes.io/uninitialized
+        operator: Exists
+        effect: NoSchedule
     secret:
       create: true
       name: cloud-config
