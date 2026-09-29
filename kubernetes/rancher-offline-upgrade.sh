@@ -1,158 +1,99 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+# Upgrade an existing Rancher release from a rancher-download.sh package.
+set -Eeuo pipefail
+die() { echo "ERROR: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "$1 is required"; }
+sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+norm() { sed -E 's/^v//; s/[[:space:]].*$//'; }
+cli_version() { "$1" --version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | norm; }
 
-# -----------------------------
-# Configurable variables
-# -----------------------------
-OFFLINE_CHART_DIR="./charts"
-OFFLINE_CLI_DIR="./cli"
+PACKAGE=${1:-.}; KUBECONFIG=${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}
+SYSTEM_DEFAULT_REGISTRY=${SYSTEM_DEFAULT_REGISTRY:-}; TIMEOUT=${HELM_TIMEOUT:-15m}
+# Set SINGLE_NODE=true for a one-node Rancher installation. This permits the
+# required anti-affinity and rollout-strategy changes for an in-place upgrade.
+SINGLE_NODE=${SINGLE_NODE:-false}
+# Optional seconds between progress updates while Helm is waiting (default: 10).
+WAIT=${WAIT:-10}
+MANIFEST="$PACKAGE/manifest.tsv"
+value() { awk -F '\t' -v k="$1" '$1==k {print substr($0,length(k)+2);exit}' "$MANIFEST"; }
+newer() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" && "$1" != "$2" ]]; }
 
-# If you have a private registry, put it here, e.g. "registry.local:5000"
-# If you preloaded images manually, leave it empty.
-SYSTEM_DEFAULT_REGISTRY="${SYSTEM_DEFAULT_REGISTRY:-}"
-
-# -----------------------------
-# Helper functions
-# -----------------------------
-get_installed_version() {
-  rancher --version | awk '{print $3}' | sed 's/^v//'
+show_progress() {
+  echo "[$(date '+%F %T')] Rancher upgrade progress:"
+  kubectl --kubeconfig "$KUBECONFIG" -n cattle-system get deployment rancher \
+    -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AVAILABLE:.status.availableReplicas --no-headers 2>/dev/null || true
+  kubectl --kubeconfig "$KUBECONFIG" -n cattle-system get pods -l app=rancher \
+    -o custom-columns=NAME:.metadata.name,READY:.status.containerStatuses[*].ready,STATUS:.status.phase,NODE:.spec.nodeName --no-headers 2>/dev/null || true
+  kubectl --kubeconfig "$KUBECONFIG" -n cattle-system get events --sort-by=.lastTimestamp 2>/dev/null \
+    | tail -n 4 | sed 's/^/  event: /' || true
 }
 
-# -----------------------------
-# 1. Detect current version
-# -----------------------------
-INSTALLED_VERSION=$(get_installed_version || echo "0.0.0")
-echo "Current Rancher CLI version: v$INSTALLED_VERSION"
-
-# -----------------------------
-# 2. Discover available local chart versions
-#    Expect files like: rancher-2.9.2.tgz
-# -----------------------------
-if [[ ! -d "$OFFLINE_CHART_DIR" ]]; then
-  echo "ERROR: $OFFLINE_CHART_DIR does not exist. Please copy rancher-<version>.tgz files here."
-  exit 1
-fi
-
-AVAILABLE_VERSIONS=$(
-  find "$OFFLINE_CHART_DIR" -maxdepth 1 -type f -name 'rancher-*.tgz' \
-  | sed -E 's|.*/rancher-([0-9]+\.[0-9]+\.[0-9]+)\.tgz|\1|' \
-  | sort -V | uniq
-)
-
-if [[ -z "$AVAILABLE_VERSIONS" ]]; then
-  echo "No local Rancher chart files found in $OFFLINE_CHART_DIR"
-  exit 1
-fi
-
-# Filter versions higher than installed version
-UPGRADE_VERSIONS=()
-for version in $AVAILABLE_VERSIONS; do
-  # Compare "INSTALLED_VERSION < version" using sort -V
-  if [[ "$(printf '%s\n' "$INSTALLED_VERSION" "$version" | sort -V | head -n1)" == "$INSTALLED_VERSION" ]] \
-     && [[ "$version" != "$INSTALLED_VERSION" ]]; then
-    UPGRADE_VERSIONS+=("$version")
+run_helm_with_progress() {
+  local log_file pid status
+  log_file=$(mktemp)
+  "$@" >"$log_file" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    show_progress
+    sleep "$WAIT"
+  done
+  if wait "$pid"; then
+    cat "$log_file"
+    rm -f "$log_file"
+    return 0
   fi
+  status=$?
+  echo "Helm upgrade failed (exit $status). Helm output:" >&2
+  cat "$log_file" >&2
+  rm -f "$log_file"
+  return "$status"
+}
+
+for x in helm kubectl cubectl jq tar shasum awk find install; do need "$x"; done
+[[ -f "$MANIFEST" ]] || die "package manifest not found"
+[[ -n "$SYSTEM_DEFAULT_REGISTRY" ]] || die "set SYSTEM_DEFAULT_REGISTRY to the registry containing package images"
+VERSION=$(value version); CHART="$PACKAGE/$(value chart)"; CLI="$PACKAGE/$(value cli)"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -f "$CHART" && -f "$CLI" ]] || die "incomplete package"
+[[ "$(sha "$CHART")" == "$(value chart_sha256)" ]] || die "chart checksum mismatch"
+[[ "$(sha "$CLI")" == "$(value cli_sha256)" ]] || die "CLI checksum mismatch"
+for asset in rancher-images.txt rancher-save-images.sh rancher-load-images.sh rancher-images.tar.gz; do
+  path="$PACKAGE/images/$asset"; key="image_${asset//./_}"
+  [[ -s "$path" && "$(sha "$path")" == "$(value "$key")" ]] || die "image asset checksum mismatch: $asset"
 done
-
-if [[ ${#UPGRADE_VERSIONS[@]} -eq 0 ]]; then
-  echo "No newer Rancher versions available in local offline directory."
-  exit 0
-fi
-
-echo "Available versions for offline upgrade (from local charts):"
-for i in "${!UPGRADE_VERSIONS[@]}"; do
-  echo "$((i+1)). v${UPGRADE_VERSIONS[i]}"
-done
-
-# -----------------------------
-# 3. Let user pick a target version
-# -----------------------------
-while true; do
-  read -p "Enter the number of the version you want to upgrade to: " CHOICE
-  if [[ "$CHOICE" =~ ^[0-9]+$ ]] && \
-     [ "$CHOICE" -ge 1 ] && \
-     [ "$CHOICE" -le "${#UPGRADE_VERSIONS[@]}" ]; then
-    break
-  else
-    echo "Invalid selection. Please enter a valid number."
+[[ "$(helm show chart "$CHART" | awk '$1=="appVersion:" {print $2}' | norm)" == "$VERSION" ]] || die "chart appVersion mismatch"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+tar -xzf "$CLI" -C "$TMP"; BIN=$(find "$TMP" -type f -name rancher -perm -u+x -print -quit)
+[[ -n "$BIN" && "$(cli_version "$BIN")" == "$VERSION" ]] || die "CLI package mismatch"
+RELEASE=$(helm --kubeconfig "$KUBECONFIG" -n cattle-system list --filter '^rancher$' -o json)
+[[ "$(jq length <<<"$RELEASE")" == 1 ]] || die "existing cattle-system/rancher release not found"
+CURRENT=$(jq -r '.[0].app_version' <<<"$RELEASE" | norm); newer "$CURRENT" "$VERSION" || die "target v$VERSION is not newer than deployed server v$CURRENT"
+CURRENT_VALUES=$(helm --kubeconfig "$KUBECONFIG" -n cattle-system get values rancher --all -o json)
+CURRENT_REPLICAS=$(jq -r '.replicas // 1' <<<"$CURRENT_VALUES")
+CURRENT_AFFINITY=$(jq -r '.antiAffinity // "preferred"' <<<"$CURRENT_VALUES")
+UPGRADE_OVERRIDES=()
+if [[ "$CURRENT_REPLICAS" == 1 && "$CURRENT_AFFINITY" == required ]]; then
+  if [[ "$SINGLE_NODE" != true ]]; then
+    die "one replica with antiAffinity=required cannot perform a rolling upgrade. Re-run with SINGLE_NODE=true to set antiAffinity=preferred for this upgrade."
   fi
-done
-
-SELECTED_VERSION=${UPGRADE_VERSIONS[$((CHOICE-1))]}
-SELECTED_CHART="$OFFLINE_CHART_DIR/rancher-$SELECTED_VERSION.tgz"
-
-if [[ ! -f "$SELECTED_CHART" ]]; then
-  echo "ERROR: Chart file not found: $SELECTED_CHART"
-  exit 1
+  echo "NOTICE: switching antiAffinity from required to preferred for this single-node upgrade."
+  UPGRADE_OVERRIDES+=(--set-string antiAffinity=preferred)
 fi
-
-echo "Upgrading Rancher to v$SELECTED_VERSION using chart: $SELECTED_CHART"
-
-# -----------------------------
-# 4. Prepare Helm values
-# -----------------------------
-REPLICAS=$(k3s kubectl get nodes -o go-template='{{len .items}}')
-
-VALUES=$(cat <<EOF
-bootstrapPassword: admin
-replicas: $REPLICAS
-ingress:
-  enabled: true
-  pathType: ImplementationSpecific
-  path: "/"
-  tls:
-    source: secret
-tls: external
-privateCA: true
-useBundledSystemChart: true
-antiAffinity: required
-EOF
-)
-
-# Add systemDefaultRegistry if specified
-if [[ -n "$SYSTEM_DEFAULT_REGISTRY" ]]; then
-  VALUES=$(cat <<EOF
-systemDefaultRegistry: "$SYSTEM_DEFAULT_REGISTRY"
-$VALUES
-EOF
-)
+if [[ "$SINGLE_NODE" == true ]]; then
+  echo "NOTICE: configuring a single-node rollout (maxUnavailable=1, maxSurge=0). Rancher will be briefly unavailable while its pod is replaced."
+  kubectl --kubeconfig "$KUBECONFIG" -n cattle-system patch deployment rancher --type merge \
+    -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1,"maxSurge":0}}}}'
 fi
-
-# -----------------------------
-# 5. Offline Helm upgrade using local chart file
-# -----------------------------
-echo "Running Helm upgrade (offline)..."
-helm --kubeconfig /etc/rancher/k3s/k3s.yaml upgrade --install rancher "$SELECTED_CHART" \
-  --namespace cattle-system \
-  --create-namespace \
-  --values <(echo "$VALUES")
-
-echo "Helm upgrade finished."
-
-# -----------------------------
-# 6. Install Rancher CLI from local tarball (if available)
-# -----------------------------
-CLI_TARBALL="$OFFLINE_CLI_DIR/rancher-linux-amd64-v$SELECTED_VERSION.tar.gz"
-echo "Checking for local Rancher CLI tarball: $CLI_TARBALL"
-
-if [[ -f "$CLI_TARBALL" ]]; then
-  echo "Installing Rancher CLI v$SELECTED_VERSION from local file..."
-  # Ensure dir exists
-  mkdir -p /usr/local/bin
-
-  # Extract only the 'rancher' binary (strip components like original script)
-  tar -xz -f "$CLI_TARBALL" --strip-components=2 -C /usr/local/bin/
-
-  # Your custom sync to other nodes (unchanged)
-   cubectl node rsync -r control /usr/local/bin/rancher
-
-  echo "Rancher CLI installed successfully from offline package."
+echo "Upgrading Rancher Server v$CURRENT -> v$VERSION from verified package"
+run_helm_with_progress helm --kubeconfig "$KUBECONFIG" upgrade rancher "$CHART" -n cattle-system --reuse-values \
+  --set-string "systemDefaultRegistry=$SYSTEM_DEFAULT_REGISTRY" "${UPGRADE_OVERRIDES[@]}" --atomic --wait --timeout "$TIMEOUT"
+UPDATED=$(helm --kubeconfig "$KUBECONFIG" -n cattle-system list --filter '^rancher$' -o json | jq -r '.[0].app_version' | norm)
+[[ "$UPDATED" == "$VERSION" ]] || die "Helm release reports v$UPDATED after upgrade"
+kubectl --kubeconfig "$KUBECONFIG" -n cattle-system rollout status deployment/rancher --timeout="$TIMEOUT"
+install -m 0755 "$BIN" /usr/local/bin/rancher
+rancher --version | grep -q "v$VERSION" || die "installed CLI version check failed"
+if [[ "$SINGLE_NODE" == true ]]; then
+  echo "Skipping Rancher CLI sync because SINGLE_NODE=true."
 else
-  echo "Local CLI tarball not found for v$SELECTED_VERSION. Skipping CLI installation."
+  cubectl node rsync -r control /usr/local/bin/rancher
 fi
-
-# -----------------------------
-# 7. Show new version (CLI)
-# -----------------------------
-NEW_VERSION=$(get_installed_version || echo "unknown")
-echo "Rancher upgrade completed. Current Rancher CLI version: v$NEW_VERSION"
+echo "Rancher Server and Rancher CLI are both v$VERSION."
