@@ -27,7 +27,9 @@ Options:
   -h, --help       show this help
 
 Environment:
-  SKYLINE_STATIC_DIR  console static directory
+  SKYLINE_USER, SKYLINE_PASS  with --apply, use this credential instead of
+                      prompting (set by create-cos-api-user.sh)
+  SKYLINE_STATIC_DIR console static directory
                       (default /usr/local/lib/python3.9/site-packages/skyline_console/static)
   BACKUP_DIR          where .bak copies go (default /root)
 
@@ -114,14 +116,19 @@ if [[ $mode == check ]]; then
 fi
 
 # ---- collect the credential --------------------------------------------------
-[[ -t 0 ]] || die "--apply needs an interactive terminal to read the credential."
-read -r -p "Username [admin]: " user
-user="${user:-admin}"
-read -rs -p "Password: " pass; echo
-read -rs -p "Confirm password: " pass2; echo
-[[ -n $pass ]] || die "Empty password"
-[[ $pass == "$pass2" ]] || die "Passwords do not match"
-unset pass2
+if [[ -n ${SKYLINE_PASS:-} ]]; then
+    user="${SKYLINE_USER:-admin}" pass="$SKYLINE_PASS"
+    unset SKYLINE_PASS
+else
+    [[ -t 0 ]] || die "--apply needs an interactive terminal to read the credential (or set SKYLINE_USER and SKYLINE_PASS)."
+    read -r -p "Username [admin]: " user
+    user="${user:-admin}"
+    read -rs -p "Password: " pass; echo
+    read -rs -p "Confirm password: " pass2; echo
+    [[ -n $pass ]] || die "Empty password"
+    [[ $pass == "$pass2" ]] || die "Passwords do not match"
+    unset pass2
+fi
 
 # ---- validate before touching any file --------------------------------------
 if (( validate )); then
