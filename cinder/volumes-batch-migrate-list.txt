@@ -1,0 +1,4 @@
+# Batch list: one image filename per line, resolved under /mnt/cephfs/glance.
+# Replace these example names with filenames that exist in that directory.
+server-a.qcow2
+server-b.raw
