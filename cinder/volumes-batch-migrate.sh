@@ -81,12 +81,19 @@ choose_project() {
     unset OS_PROJECT_DOMAIN_NAME
     export OS_PROJECT_DOMAIN_ID OS_PROJECT_NAME=${PROJECT_NAMES[$((selection - 1))]}
     log "Project → $OS_PROJECT_NAME (${PROJECT_IDS[$((selection - 1))]})"
+
+    local assignment
+    assignment=$(openstack role assignment list --user admin_cli --project "${PROJECT_IDS[$((selection - 1))]}" --role admin -f value) \
+        || fail "Cannot list role assignments for admin_cli in project '$OS_PROJECT_NAME'."
+    [[ -n $assignment ]] || fail "admin_cli has no admin role in project '$OS_PROJECT_NAME'. Run: openstack role add --user admin_cli --project ${PROJECT_IDS[$((selection - 1))]} admin"
 }
 
 choose_pool() {
     local pools selection pool primary_pool=''
     local -a remaining_pools=()
-    pools=$(cinder get-pools 2>/dev/null | awk -F'|' '/\|/ && $2 ~ /name/ {gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 != "") print $3}')
+    local raw
+    raw=$(cinder get-pools 2>&1) || fail "cinder get-pools failed in project '$OS_PROJECT_NAME': $raw"
+    pools=$(awk -F'|' '/\|/ && $2 ~ /name/ {gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 != "") print $3}' <<<"$raw")
     [[ -n $pools ]] || fail 'No Cinder pools returned by cinder get-pools.'
     mapfile -t POOLS < <(printf '%s\n' "$pools")
     for pool in "${POOLS[@]}"; do
