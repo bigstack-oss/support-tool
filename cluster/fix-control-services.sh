@@ -13,7 +13,7 @@ export LC_ALL=C
 
 usage() {
     cat <<'EOF'
-Usage: bash fix-control-services.sh <rabbitmq|mariadb|all> [--apply] [--good NODE]
+Usage: bash fix-control-services.sh <rabbitmq|mariadb|all> [--apply] [--force] [--good NODE]
 
   rabbitmq   Find controllers outside the majority RabbitMQ partition and
              re-join them: stop_app, reset, join_cluster rabbit@<majority>,
@@ -29,6 +29,10 @@ Usage: bash fix-control-services.sh <rabbitmq|mariadb|all> [--apply] [--good NOD
              Galera has no Primary).
 
   --apply      Really execute. Without it, dry-run only.
+  --force      Process even when healthy; still requires --apply to execute.
+               rabbitmq: re-join all nodes except the majority peer.
+               mariadb: rebuild from --good NODE (required with --force).
+               Majority, disk-space, and SST-in-progress checks still apply.
   --good NODE  mariadb: node whose datadir is kept and bootstrapped.
   Log (apply only): ./fix-control-services-<target>-<timestamp>.log
 
@@ -41,11 +45,12 @@ EOF
 die() { echo "STOP: $*" >&2; exit 1; }
 trap 'echo "STOP: command failed at line $LINENO. Earlier changes are retained; no rollback attempted." >&2' ERR
 
-target="" apply=0 good=""
+target="" apply=0 force=0 good=""
 while (( $# )); do
     case $1 in
         rabbitmq|mariadb|all) target=$1 ;;
         --apply) apply=1 ;;
+        --force) force=1 ;;
         --good)  good=${2:?--good needs a node name}; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "Unknown argument: $1" ;;
@@ -53,6 +58,9 @@ while (( $# )); do
     shift
 done
 [[ -n $target ]] || { usage; exit 1; }
+if (( force )) && [[ $target == mariadb || $target == all ]] && [[ -z $good ]]; then
+    die '--force with mariadb/all requires --good NODE.'
+fi
 for tool in cubectl ssh jq timeout awk; do
     command -v "$tool" >/dev/null || die "Missing command: $tool"
 done
@@ -121,7 +129,7 @@ fix_rabbitmq() {
         if (( count > bestcount )); then best=$vs; bestcount=$count; fi
     done < <(printf '%s\n' "${view[@]}" | sort -u)
 
-    if (( bestcount == N )) && [[ $(wc -w <<<"$best") -eq N ]]; then
+    if (( ! force && bestcount == N )) && [[ $(wc -w <<<"$best") -eq N ]]; then
         echo "RabbitMQ OK: all $N controllers see: $best"; return 0
     fi
     (( bestcount * 2 > N )) || die "no majority RabbitMQ group (best group has $bestcount of $N). Not safe to automate; investigate by hand."
@@ -129,7 +137,13 @@ fix_rabbitmq() {
     echo "Majority group ($bestcount/$N): $best"
 
     local peer=${best%% *} bad=()
-    for n in "${NODES[@]}"; do [[ ${view[$n]} == "$best" ]] || bad+=("$n"); done
+    for n in "${NODES[@]}"; do
+        if (( force )); then
+            [[ $n == "$peer" ]] || bad+=("$n")
+        else
+            [[ ${view[$n]} == "$best" ]] || bad+=("$n")
+        fi
+    done
     echo "Nodes to re-join via rabbit@$peer: ${bad[*]}"
 
     for n in "${bad[@]}"; do
@@ -192,7 +206,12 @@ fix_mariadb() {
             "$(rsh "$n" "awk '/^safe_to_bootstrap:/{print \$2}' /var/lib/mysql/grastate.dat" 2>/dev/null || echo '?')"
         [[ $st == Synced ]] || problem=1
     done
-    if (( ! problem )); then echo "Galera OK: all $N nodes Synced. Nothing to fix."; return 0; fi
+    if (( ! problem && ! force )); then echo "Galera OK: all $N nodes Synced. Nothing to fix."; return 0; fi
+
+    if (( force )); then
+        warn "--force: rebuilding Galera from $good even if all nodes report Synced."
+        problem=1
+    fi
 
     if [[ -z $good ]]; then
         warn 'Galera is not healthy. YOU decide which node is GOOD (newest data / highest seqno; check the mariadb log if unsure).'
