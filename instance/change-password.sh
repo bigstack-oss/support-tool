@@ -2,6 +2,26 @@
 # set -e is intentionally not used to allow graceful error messages.
 set -uo pipefail
 
+# Usage: change-password.sh [add_public]
+# add_public installs the invoking user's ~/.ssh/id_rsa.pub instead of changing a password.
+MODE="${1:-password}"
+if (( $# > 1 )) || [[ "$MODE" != "password" && "$MODE" != "add_public" ]]; then
+  echo "Usage: $0 [add_public]" >&2
+  exit 1
+fi
+if [[ "$MODE" == "add_public" ]]; then
+  PUBLIC_KEY_FILE="$HOME/.ssh/id_rsa.pub"
+  if [[ ! -r "$PUBLIC_KEY_FILE" || ! -s "$PUBLIC_KEY_FILE" ]]; then
+    echo "ERROR: Public key file is missing, empty, or unreadable: $PUBLIC_KEY_FILE" >&2
+    exit 1
+  fi
+  PUBLIC_KEY=$(cat "$PUBLIC_KEY_FILE") || exit 1
+  if [[ "$PUBLIC_KEY" == *$'\n'* ]] || ! ssh-keygen -l -f "$PUBLIC_KEY_FILE" >/dev/null 2>&1; then
+    echo "ERROR: Expected one valid SSH public key in $PUBLIC_KEY_FILE" >&2
+    exit 1
+  fi
+fi
+
 LOG_FILE="/var/log/support-set-vm-password.log"
 [ -w "$(dirname "$LOG_FILE")" ] || LOG_FILE="./support-set-vm-password.log"
 
@@ -186,10 +206,12 @@ if [[ -z "$VM_USER" ]]; then
 fi
 
 # --- Step 5: Ask desired new password (hidden input) ---
-read -r -s -p "Enter the NEW password to set: " VM_PASS; echo
-if [[ -z "$VM_PASS" ]]; then
-  log "ERROR: Password cannot be empty."
-  exit 1
+if [[ "$MODE" == "password" ]]; then
+  read -r -s -p "Enter the NEW password to set: " VM_PASS; echo
+  if [[ -z "$VM_PASS" ]]; then
+    log "ERROR: Password cannot be empty."
+    exit 1
+  fi
 fi
 
 # --- Step 6: Get instance_name and compute host; then SSH and virsh ---
@@ -211,7 +233,7 @@ fi
 SSH_USER="${SSH_USER:-root}"   # Override with: export SSH_USER=ubuntu
 SSH_OPTS=${SSH_OPTS:-"-o BatchMode=yes -o StrictHostKeyChecking=accept-new"}
 
-log "About to set user password via libvirt on compute host."
+log "About to perform '$MODE' via libvirt on compute host."
 log "Compute host: $COMPUTE_HOST, instance: $INSTANCE_NAME, user: $VM_USER"
 
 # We never echo the password to logs or stdout.
@@ -226,10 +248,30 @@ PING_RC=$?
 
 # A successful ping returns {"return":{}}
 if (( PING_RC == 0 )) && grep -q '"return"' <<<"$PING_RESULT"; then
-  log "qemu-guest-agent is installed, processing password change."
+  log "qemu-guest-agent is active, processing '$MODE'."
 else
   log "ERROR: This VM ($INSTANCE_NAME) does not have an active QEMU guest agent, or the agent is unresponsive."
   log "Please verify that the qemu-guest-agent service is running inside the guest OS."
+  exit 1
+fi
+
+# Append keys through QGA (Unix guests, QEMU Guest Agent >= 5.2).
+# Omitting reset preserves existing authorized_keys entries.
+if [[ "$MODE" == "add_public" ]]; then
+  KEY_REQUEST=$(jq -cn --arg username "$VM_USER" --arg key "$PUBLIC_KEY" \
+    '{execute: "guest-ssh-add-authorized-keys", arguments: {username: $username, keys: [$key]}}') || exit 1
+  # jq @sh quotes each argument for the compute host's shell, including key comments.
+  KEY_COMMAND=$(jq -rn --arg domain "$INSTANCE_NAME" --arg request "$KEY_REQUEST" \
+    '["sudo", "virsh", "qemu-agent-command", $domain, $request] | @sh') || exit 1
+  log "Appending $PUBLIC_KEY_FILE to authorized_keys for '$VM_USER'..."
+  KEY_RESULT=$(ssh $SSH_OPTS "${SSH_USER}@${COMPUTE_HOST}" "$KEY_COMMAND" 2>>"$LOG_FILE")
+  RC=$?
+  if (( RC == 0 )) && jq -e 'has("return") and (has("error") | not)' <<<"$KEY_RESULT" >/dev/null 2>&1; then
+    log "SUCCESS: Public key added for user '$VM_USER' on instance '$INSTANCE_NAME'."
+    exit 0
+  fi
+  log "ERROR: Could not append public key. The guest must support and allow guest-ssh-add-authorized-keys (QGA >= 5.2, Unix)."
+  [[ -z "$KEY_RESULT" ]] || log "Guest agent response: $KEY_RESULT"
   exit 1
 fi
 

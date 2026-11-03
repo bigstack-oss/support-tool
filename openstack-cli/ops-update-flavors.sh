@@ -30,3 +30,5 @@ openstack flavor create --vcpus 4 --ram 4096 --disk 40 --property hw:cpu_cores=4
 openstack flavor create --vcpus 8 --ram 8192 --disk 40 --property hw:cpu_cores=8 --public b40.medium
 openstack flavor create --vcpus 4 --ram 4096 --disk 80 --property hw:cpu_cores=4 --public b80.small
 openstack flavor create --vcpus 8 --ram 8192 --disk 80 --property hw:cpu_cores=8 --public b80.medium
+
+openstack quota set --cores -1 --ram -1 --instances -1 --volumes -1 --gigabytes -1 --key-pairs -1  --backups -1 --backup-gigabytes -1 --snapshots -1 admin

@@ -200,12 +200,26 @@ def check_disk(disk, vm):
     if disk['shared']:
         fail('所選磁碟同時掛載其他 VM，請改用專門的維護流程。')
     root = vm.get('OS-EXT-SRV-ATTR:root_device_name')
-    if root and disk['device'] and root != disk['device']:
+    if not root or not disk['device']:
+        fail('無法確認 VM root device 或磁碟 device，停止以避免選錯磁碟。')
+    if root != disk['device']:
         fail('所選磁碟 {} 不符 VM root device {}。'.format(disk['device'], root))
 
 
+def root_disk(volumes, vm):
+    root = vm.get('OS-EXT-SRV-ATTR:root_device_name')
+    if not root:
+        fail('API 未提供 VM root device，無法自動選取 OS disk。')
+    matches = [disk for disk in volumes if disk['device'] == root]
+    if len(matches) != 1:
+        fail('root device {} 必須對應唯一的掛載 volume；找到 {} 個。'
+             .format(display(root), len(matches)))
+    check_disk(matches[0], vm)
+    return matches[0]
+
+
 def main():
-    parser = argparse.ArgumentParser(description='選 zone → project → VM → OS disk → profile，設定 image metadata')
+    parser = argparse.ArgumentParser(description='選 zone → project → VM / ALL VM → 自動選取 root disk → profile，設定 image metadata')
     parser.add_argument('--dry-run', action='store_true', help='只預覽，不寫入 metadata 或開關機')
     args = parser.parse_args()
     for command in ('openstack', 'nova-manage', 'cinder'):
@@ -227,8 +241,58 @@ def main():
     print('Selected project name: ' + display(project['Name']))
     servers = osc('server', 'list', '--all-projects', '--project', project_id,
                   '--availability-zone', zone, '--long')
-    server = choose('VM', servers, lambda s: '{} ({}) [status={}]'.format(
-        s['ID'], s['Name'], s['Status']))
+    if not servers:
+        fail('No VM available for selection.')
+    server = choose('VM', servers + [None], lambda s:
+                    'ALL VM' if s is None else '{} ({}) [status={}]'.format(
+                        s['ID'], s['Name'], s['Status']))
+    selected = servers if server is None else [server]
+    print('將依序處理所選 zone / project 中的 {} 台 VM。'.format(len(selected)))
+    batch = None
+    if server is None:
+        print('ALL VM：以下選擇套用至整批 VM；無法確認 root disk 的 VM 會跳過。')
+        shutdown = False
+        if not args.dry_run:
+            shutdown = ask('Do you want to shutdown the VM? Type "YES" to confirm: ') == 'YES'
+            if not shutdown:
+                print('未同意關機：ACTIVE VM 將跳過，只處理 SHUTOFF VM。')
+        properties = select_properties()
+        print('Batch metadata: ' + json.dumps(properties, ensure_ascii=True))
+        if not args.dry_run:
+            if ask('Confirm the selected metadata for all VMs? Type "YES" to confirm: ') != 'YES':
+                print('已取消整批操作，未關機或修改 metadata。')
+                return
+            power_on = ask('Do you want to power on the VM after metadata change? Type "YES" to confirm: ') == 'YES'
+        else:
+            power_on = False
+        batch = dict(shutdown=shutdown, properties=properties, power_on=power_on)
+    results = ['NOT RUN'] * len(selected)
+    try:
+        for index, server in enumerate(selected, 1):
+            print('\n=== VM {}/{}: {} ({}) ==='.format(
+                index, len(selected), display(server['Name']), server['ID']))
+            try:
+                results[index - 1] = update_vm(server, project, zone, args, batch)
+            except (EOFError, KeyboardInterrupt):
+                results[index - 1] = 'INTERRUPTED'
+                raise
+            except (RuntimeError, OSError):
+                results[index - 1] = 'FAILED'
+                raise
+    finally:
+        print('\nSummary:')
+        for index, (server, result) in enumerate(zip(selected, results), 1):
+            try:
+                current = osc('server', 'show', server['ID'])
+                status = field(current, 'status', 'Status', default='UNKNOWN')
+            except (RuntimeError, OSError):
+                status = 'UNKNOWN'
+            print('{}. {} ({}) [status={}] ({})'.format(
+                index, server['ID'], display(server['Name']), display(status), result))
+
+
+def update_vm(server, project, zone, args, batch=None):
+    project_id = project['ID']
     vm_id = server['ID']
     print('Selected VM name: ' + display(server['Name']))
     vm = check_vm(vm_id, project_id, zone, require_shutoff=False)
@@ -236,22 +300,30 @@ def main():
     # Do not assume the first attached volume is the OS disk.
     preview_disks = disks(vm_id, project_id)
     print('\nCurrent attached-volume image metadata:')
-    if not preview_disks:
-        fail('VM 沒有掛載的 volume，無法選取 OS disk。')
     for preview in preview_disks:
         print('Volume: {} ({}) [device={}]'.format(
             preview['id'], display(preview['name']), display(preview['device'] or '?')))
         metadata = preview['volume'].get('volume_image_metadata')
         print(json.dumps(structured(metadata, dict) if metadata else {},
                          indent=2, ensure_ascii=True))
+    # Resolve the root disk before asking to shut down the VM.
+    try:
+        root_disk(preview_disks, vm)
+    except RuntimeError as error:
+        print('SKIP VM {} ({}): {}'.format(
+            display(server['Name']), vm_id, error))
+        print('未關機或修改 metadata。')
+        return 'SKIP'
     status = str(field(vm, 'status', 'Status')).upper()
     if status == 'ACTIVE':
         if args.dry_run:
             print('DRY RUN：VM 為 ACTIVE；正式套用前需要確認關機。')
         else:
-            if ask('Do you want to shutdown the VM? Type "YES" to confirm: ') != 'YES':
+            shutdown = batch['shutdown'] if batch is not None else (
+                ask('Do you want to shutdown the VM? Type "YES" to confirm: ') == 'YES')
+            if not shutdown:
                 print('已取消，未關機或修改 metadata。')
-                return
+                return 'SKIP'
             check_vm(vm_id, project_id, zone, require_shutoff=False)
             run(['openstack', 'server', 'stop', vm_id])
             print('等待 VM 關機至 SHUTOFF...', flush=True)
@@ -260,20 +332,12 @@ def main():
     elif status != 'SHUTOFF':
         fail('只支援 ACTIVE 或 SHUTOFF VM；目前為 {}。'.format(display(status)))
     volumes = disks(vm_id, project_id)
-    root = vm.get('OS-EXT-SRV-ATTR:root_device_name')
-    print('\nVM root device：{}'.format(display(root or 'API 未提供，請自行確認 OS disk')))
-    print('bootable=true 僅為提示，不保證是這台 VM 的 OS disk。')
-    disk = choose('OS disk', volumes, lambda d:
-                  '{} ({}) [device={}, size={} GiB, bootable={}]{}'.format(
-                      d['id'], d['name'], d['device'] or '?', d['size'], d['bootable'],
-                      ' [root device]' if root and root == d['device'] else ''))
-    check_disk(disk, vm)
+    disk = root_disk(volumes, vm)
+    print('Auto-selected OS disk: {} ({}) [root device={}]'.format(
+        disk['id'], display(disk['name']), display(disk['device'])))
     vol_id = disk['id']
     print('Selected volume name: ' + display(disk['name']))
-    print('\nCurrent volume image metadata:')
-    before = disk['volume'].get('volume_image_metadata')
-    print(json.dumps(structured(before, dict) if before else {}, indent=2, ensure_ascii=True))
-    properties = select_properties()
+    properties = batch['properties'] if batch is not None else select_properties()
     commands = []
     for key, value in properties.items():
         commands.extend([
@@ -287,10 +351,10 @@ def main():
         print('  ' + ' '.join(shlex.quote(x) for x in command))
     if args.dry_run:
         print('\nDRY RUN：未修改任何 metadata，未執行開關機。')
-        return
-    if ask('\nConfirm this is the OS disk and apply changes? Type "YES" to confirm: ') != 'YES':
+        return 'DRY RUN'
+    if batch is None and ask('\nConfirm this is the OS disk and apply changes? Type "YES" to confirm: ') != 'YES':
         print('已取消，未修改 metadata。')
-        return
+        return 'SKIP'
     # Re-read state and attachments after the user finishes the menu.
     vm = check_vm(vm_id, project_id, zone)
     current = [d for d in disks(vm_id, project_id) if d['id'] == vol_id]
@@ -319,24 +383,27 @@ def main():
     except (RuntimeError, OSError) as error:
         fail('設定或驗證失敗，可能部分完成；不會自動開機。\n已成功的寫入指令：\n{}\n{}'
              .format('\n'.join(completed) or '(無)', error))
-    print('\nUpdated volume image metadata:')
-    print(json.dumps(actual, indent=2, ensure_ascii=True))
     print('\nMetadata 設定完成。')
-    if ask('Do you want to power on the VM? Type "YES" to confirm: ') == 'YES':
+    power_on = batch['power_on'] if batch is not None else (
+        ask('Do you want to power on the VM? Type "YES" to confirm: ') == 'YES')
+    if power_on:
         check_vm(vm_id, project_id, zone)
         run(['openstack', 'server', 'start', vm_id])
         print('等待 VM 開機至 ACTIVE...', flush=True)
         wait_vm(vm_id, project_id, zone, 'ACTIVE')
         print('VM 已開機。請在 guest 內確認所選功能。')
-        print('\nVolume image metadata after power-on ({}):'.format(vol_id))
-        after = osc('volume', 'show', vol_id).get('volume_image_metadata')
-        print(json.dumps(structured(after, dict) if after else {},
-                         indent=2, ensure_ascii=True))
-        for key in properties:
-            print('Nova {} 回讀值：{}'.format(key, display(
-                run(['nova-manage', 'image_property', 'show', vm_id, key]))))
     else:
         print('VM 保持關機。')
+    label = 'after power-on' if power_on else 'after update (VM remains SHUTOFF)'
+    print('\nVolume image metadata {} ({}):'.format(label, vol_id))
+    after = osc('volume', 'show', vol_id).get('volume_image_metadata')
+    print(json.dumps(structured(after, dict) if after else {},
+                     indent=2, ensure_ascii=True))
+    for key in properties:
+        print('Nova {} 回讀值：{}'.format(key, display(
+            run(['nova-manage', 'image_property', 'show', vm_id, key]))))
+
+    return 'OK'
 
 
 

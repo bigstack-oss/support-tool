@@ -19,7 +19,9 @@ Usage: bash restore-pacemaker-remote-missing.sh [--check|--apply] [--since TIME]
                  e.g. --since "2026-10-05 16:00".
   --ref NODE     Healthy existing remote used as the authkey reference
                  (default: first remote resource found in the CIB).
-  NODE           Remote resource ID == hostname (default: idc-bs-cs01..03).
+  NODE           Remote resource ID == hostname (default: every node with
+                 role "compute" in `cubectl node list -j` that has no remote
+                 resource in the CIB; control-converged nodes are excluded).
 
 Apply, per node: requires quorum and no maintenance mode, and requires the
 resource to be absent from the CIB. Starts pacemaker_remote only if it is
@@ -48,9 +50,9 @@ while (( $# )); do
     esac
     shift
 done
-(( ${#nodes[@]} )) || nodes=(idc-bs-cs01 idc-bs-cs02 idc-bs-cs03)
+name_re='^[a-zA-Z0-9][a-zA-Z0-9_.-]*$'
 for n in "${nodes[@]}" ${ref:+"$ref"}; do
-    [[ $n =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die "Invalid node name: $n"
+    [[ $n =~ $name_re ]] || die "Invalid node name: $n"
 done
 for tool in pcs cibadmin crm_mon crm_node corosync-quorumtool ssh timeout awk grep md5sum; do
     command -v "$tool" >/dev/null || die "Missing command: $tool"
@@ -73,6 +75,18 @@ res_started()   { grep -Eq "<resource id=\"$1\"[^>]*role=\"Started\"" <<<"$2"; }
 online_count()  { grep -c '<node name="[^"]*"[^>]*online="true"' <<<"$1" || true; }
 svc_state()     { remote "$1" 'systemctl is-active pacemaker_remote' 2>/dev/null || true; }
 authkey_sum()   { remote "$1" 'md5sum /etc/pacemaker/authkey' 2>/dev/null | awk '{print $1}' || true; }
+# Default targets: pure compute nodes not already in the CIB. -r matches role
+# bits, so it also lists control-converged nodes; keep only role == compute.
+if (( ! ${#nodes[@]} )); then
+    compute=$(timeout 20 cubectl node list -j -r compute | jq -r '.[] | select(.role == "compute") | .hostname') \
+        || die 'cubectl node list -j -r compute failed; pass NODE names explicitly.'
+    [[ -n $compute ]] || { echo "No compute-role nodes (pacemaker remotes) in this cluster; nothing to do."; exit 0; }
+    for n in $compute; do
+        [[ $n =~ $name_re ]] || die "Invalid node name from cubectl: $n"
+        in_cib "$n" || nodes+=("$n")
+    done
+    (( ${#nodes[@]} )) || { echo "No compute node is missing its pacemaker remote resource; nothing to do."; exit 0; }
+fi
 target_re=$(IFS='|'; echo "${nodes[*]}")
 
 # Existing remote resources in the CIB, and the reference node.

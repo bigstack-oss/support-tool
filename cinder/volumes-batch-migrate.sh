@@ -6,6 +6,7 @@ set -euo pipefail
 LOGFILE=/var/log/support-volume-migrate.log
 GLANCE_DIR=/mnt/cephfs/glance
 DEFAULT_OUTDIR=/mnt/cephfs/glance/output
+RAW_STAGE_DIR=/mnt/cephfs/glance/raw
 MANAGE_WAIT_SECONDS=300
 
 log()  { local now; now=$(date '+%F %T'); printf '\033[32m[INFO]\033[0m  %s %s\n' "$now" "$*"; printf '%s [INFO] %s\n' "$now" "$*" >>"$LOGFILE" 2>/dev/null || true; }
@@ -182,10 +183,17 @@ set_cube_volume_type() {
 
 choose_migration_type() {
     printf 'Select migration type:\n1. v2v (operating-system conversion)\n2. disk (raw disk import)\n'
+    if [[ $BACKEND == rbd ]]; then
+        printf '3. disk (raw disk import,fast)\n'
+    fi
     read -r -p 'Enter option number: ' answer
     case $answer in
         1) MIGRATION_TYPE=v2v ;;
         2) MIGRATION_TYPE=disk ;;
+        3)
+            [[ $BACKEND == rbd ]] || fail 'Fast disk import is available only for RBD backends.'
+            MIGRATION_TYPE=disk-fast
+            ;;
         *) fail 'Invalid migration type.' ;;
     esac
 }
@@ -228,6 +236,16 @@ stage_disk_to_nfs() {
         log "Converting $FILE_FORMAT disk to raw on NFS staging path."
         qemu-img convert -p -O raw -- "$SRC_IMG" "$destination"
     fi
+    STAGED_DISK=$destination
+}
+
+stage_disk_to_raw() {
+    local base=$1 destination
+    destination="$RAW_STAGE_DIR/${base}-${TS}.raw"
+    [[ ! -e $destination ]] || fail "Refusing to overwrite existing file '$destination'."
+    log "Converting $FILE_FORMAT disk to raw on the RBD staging path: $destination"
+    qemu-img convert -p -O raw -- "$SRC_IMG" "$destination" \
+        || fail "qemu-img raw staging conversion failed; any partial file was retained: $destination"
     STAGED_DISK=$destination
 }
 
@@ -283,16 +301,28 @@ manage_nfs_volume() {
 manage_rbd_volume() {
     local rbd_name
     rbd_name="${BASE_NAME}-import-${TS}"
-    if [[ $MIGRATION_TYPE == disk && $FILE_FORMAT != raw ]]; then
-        log "Converting image directly into RBD: $VOL_POOL/$rbd_name"
-        qemu-img convert -p -O raw "$SRC_IMG" "rbd:$VOL_POOL/$rbd_name" || fail 'qemu-img RBD conversion failed.'
+    if [[ $MIGRATION_TYPE == disk ]]; then
+        if [[ $FILE_FORMAT != raw ]]; then
+            log "Converting image directly into RBD: $VOL_POOL/$rbd_name"
+            qemu-img convert -p -O raw "$SRC_IMG" "rbd:$VOL_POOL/$rbd_name" || fail 'qemu-img RBD conversion failed.'
+        else
+            log "Importing raw disk into RBD: $VOL_POOL/$rbd_name"
+            rbd --id cinder import "$STAGED_DISK" "$VOL_POOL/$rbd_name" || fail 'RBD import failed.'
+        fi
     else
-        log "Importing raw disk into RBD: $VOL_POOL/$rbd_name"
-        rbd --id cinder import "$STAGED_DISK" "$VOL_POOL/$rbd_name" || fail 'RBD import failed.'
+        log "Importing staged raw disk into RBD: $VOL_POOL/$rbd_name"
+        rbd --id cinder import "$STAGED_DISK" "$VOL_POOL/$rbd_name" || fail 'RBD import failed; the staged raw file was retained.'
     fi
     VOL_NAME="${BASE_NAME}-${TS}"
     log "Managing RBD image as '$VOL_NAME'."
     cinder manage --bootable --volume-type "$VOL_TYPE" --name "$VOL_NAME" "$POOL" "$rbd_name" || fail 'Cinder RBD manage failed.'
+}
+
+cleanup_raw_staging_file() {
+    local file=$1
+    [[ -e $file ]] || fail "Expected raw staging file is missing during cleanup: $file"
+    log "Removing completed raw staging file: $file"
+    rm -- "$file" || fail "Could not remove completed raw staging file: $file"
 }
 
 wait_for_managed_volume() {
@@ -353,7 +383,9 @@ migrate_image() {
         detect_os "$STAGED_DISK"
         manage_nfs_volume
     else
-        if [[ $MIGRATION_TYPE == disk ]]; then
+        if [[ $MIGRATION_TYPE == disk-fast ]]; then
+            stage_disk_to_raw "$BASE_NAME"
+        elif [[ $MIGRATION_TYPE == disk ]]; then
             STAGED_DISK=$SRC_IMG
         else
             run_v2v_to_dir "$DEFAULT_OUTDIR"
@@ -368,6 +400,9 @@ migrate_image() {
     if [[ $BACKEND == rbd ]]; then rbd du "$VOL_POOL/volume-$VOL_ID" || warn 'rbd du failed.'; fi
     openstack volume show "$VOL_NAME" -f json | jq '.volume_image_metadata'
     log "Migration completed: $VOL_NAME (ID: $VOL_ID)"
+    if [[ $BACKEND == rbd && $MIGRATION_TYPE == disk-fast ]]; then
+        cleanup_raw_staging_file "$STAGED_DISK"
+    fi
 }
 
 main() {
@@ -390,6 +425,8 @@ main() {
     else
         if [[ $MIGRATION_TYPE == v2v ]]; then
             mkdir -p "$DEFAULT_OUTDIR"
+        elif [[ $MIGRATION_TYPE == disk-fast ]]; then
+            mkdir -p "$RAW_STAGE_DIR" || fail "Cannot create RBD raw staging directory: $RAW_STAGE_DIR"
         fi
     fi
 
