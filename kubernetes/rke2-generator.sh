@@ -18,6 +18,296 @@ ensure_flavor() {
   fi
 }
 
+# --- Write the 3 config files from collected values -------------------------
+write_files() {
+  # --- Step 7: output configuration & save to file (ASCII box, fixed order) ---
+  echo
+  outfile="${dst_dir}/01-rke2-config.txt"
+    
+  # Ordered config (parallel arrays)
+  keys=(
+    "password"
+    "activeTimeout"
+    "authUrl"
+    "endpointType"
+    "flavorName"
+    "floatingPool"
+    "imageName"
+    "insecure"
+    "ipVersion"
+    "netId"
+    "secGroup"
+    "sshPort"
+    "sshUser"
+    "tenantId"
+    "userId"
+  )
+
+  values=(
+    "$USER_PASS"
+    "200"
+    "${OS_AUTH_URL:-}"
+    "publicURL"
+    "appfw.medium"
+    "$external_network_name"
+    "$image_name"
+    "[v] checked"
+    "4"
+    "$network_id"
+    "default,default-k8s"
+    "22"
+    "ubuntu"
+    "$project_id"
+    "$user_id"
+  )
+
+  # Calculate max widths
+  max_key=0
+  max_val=0
+  for i in "${!keys[@]}"; do
+    (( ${#keys[$i]} > max_key )) && max_key=${#keys[$i]}
+    (( ${#values[$i]} > max_val )) && max_val=${#values[$i]}
+  done
+
+  max_no=$(( ${#keys[@]} - 1 )); max_no=${#max_no}
+  (( max_no < 2 )) && max_no=2
+
+  border="+-$(printf '%*s' "$max_no" '' | tr ' ' '-')-+-$(printf '%*s' "$max_key" '' | tr ' ' '-')-+-$(printf '%*s' "$max_val" '' | tr ' ' '-')-+"
+
+  {
+    echo "$border"
+    printf "| %-*s | %-*s | %-*s |\n" $max_no "No" $max_key "Key" $max_val "Value"
+    echo "$border"
+    for i in "${!keys[@]}"; do
+      printf "| %-*s | %-*s | %-*s |\n" $max_no "$i" $max_key "${keys[$i]}" $max_val "${values[$i]}"
+    done
+    echo "$border"
+  } | tee "$outfile"
+
+  additional_manifest="${dst_dir}/02-additional-manifest.yaml"
+  cat > "$additional_manifest" <<CC
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: openstack-cloud-controller-manager
+  annotations:
+    provisioningcattleiodriver: ""
+  finalizers: []
+  generatename: ""
+  labels: {}
+  managedfields: []
+  namespace: kube-system
+  ownerreferences: []
+  resourceversion: ""
+spec:
+  chart: openstack-cloud-controller-manager
+  repo: https://kubernetes.github.io/cloud-provider-openstack
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    tolerations:
+      - key: node-role.kubernetes.io/etcd
+        operator: Exists
+        effect: NoExecute
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node.cloudprovider.kubernetes.io/uninitialized
+        operator: Exists
+        effect: NoSchedule
+    secret:
+      create: true
+      name: cloud-config
+    cloudConfig:
+      global:
+        auth-url: "${OS_AUTH_URL:-}"
+        tenant-name: "${project_name}"
+        username: "${project_name}"
+        password: "${USER_PASS}"
+        region: "${region_name}"
+        domain-name: "${domain_name}"
+        tls-insecure: "true"
+      loadBalancer:
+        floating-network-id: "${external_network_id}"
+        subnet-id: "${network_subnet_id}"
+      blockStorage:
+        ignore-volume-az: true
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: openstack-cinder-csi
+  annotations:
+    provisioningcattleiodriver: ""
+  namespace: kube-system
+spec:
+  chart: openstack-cinder-csi
+  repo: https://kubernetes.github.io/cloud-provider-openstack
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    secret:
+      enabled: true
+      name: cloud-config
+    storageClass:
+      enabled: false
+      custom: |-
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata:
+          annotations:
+            storageclass.kubernetes.io/is-default-class: "true"
+          name: csi-cinder
+        provisioner: cinder.csi.openstack.org
+        reclaimPolicy: Retain
+        allowVolumeExpansion: true
+        ---
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshotClass
+        metadata:
+          name: csi-cinder-snapclass
+        driver: cinder.csi.openstack.org
+        deletionPolicy: Delete
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: csi-manila-secrets
+  namespace: kube-system
+stringData:
+  os-authURL: "${OS_AUTH_URL:-}"
+  os-region: "${region_name}"
+  os-domainName: "${domain_name}"
+  os-userName: "${project_name}"
+  os-password: "${USER_PASS}"
+  os-projectName: "${project_name}"
+  os-TLSInsecure: "true"
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: csi-driver-nfs
+  annotations:
+    provisioningcattleiodriver: ""
+  namespace: kube-system
+spec:
+  chart: csi-driver-nfs
+  repo: https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    externalSnapshotter:
+      enabled: false
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: openstack-manila-csi
+  annotations:
+    provisioningcattleiodriver: ""
+  namespace: kube-system
+spec:
+  chart: openstack-manila-csi
+  repo: https://kubernetes.github.io/cloud-provider-openstack
+  targetNamespace: kube-system
+  bootstrap: true
+  valuesContent: |
+    storageClass:
+      enabled: false
+      custom: |-
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-manila-nfs
+provisioner: nfs.manila.csi.openstack.org
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+parameters:
+  type: tenant_share_type
+  shareNetworkID: "${shareNetworkID}"
+  csi.storage.k8s.io/provisioner-secret-name: csi-manila-secrets
+  csi.storage.k8s.io/provisioner-secret-namespace: kube-system
+  csi.storage.k8s.io/controller-expand-secret-name: csi-manila-secrets
+  csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
+  csi.storage.k8s.io/node-stage-secret-name: csi-manila-secrets
+  csi.storage.k8s.io/node-stage-secret-namespace: kube-system
+  csi.storage.k8s.io/node-publish-secret-name: csi-manila-secrets
+  csi.storage.k8s.io/node-publish-secret-namespace: kube-system
+CC
+
+  edit_cluster="${dst_dir}/03-edit-cluster.yaml"
+  cat > "$edit_cluster" <<CCEY
+    machineSelectorConfig:
+      - config: 
+          disable-cloud-controller: true
+          kubelet-arg:
+            - cloud-provider=external
+          protect-kernel-defaults: false
+CCEY
+
+  cubectl node -r control rsync rke2-config
+
+  echo
+  echo "Config files written:"
+  echo "- $outfile"
+  echo "- $additional_manifest"
+  echo "- $edit_cluster"
+}
+
+# --- Regenerate mode: marker found -> rebuild files from previous output ------
+# Skips all OpenStack CLI calls; values come from the existing 01/02 files.
+mapfile -t done_projects < <(
+  for f in /etc/appliance/state/rke2_*_manila_init_done; do
+    p="${f#/etc/appliance/state/rke2_}"; p="${p%_manila_init_done}"
+    [[ -f "./rke2-config/$p/01-rke2-config.txt" && -f "./rke2-config/$p/02-additional-manifest.yaml" ]] && echo "$p"
+  done
+)
+
+if (( ${#done_projects[@]} > 0 )); then
+  echo "Projects already initialized (marker found):"
+  for i in "${!done_projects[@]}"; do
+    printf "%2d. %s\n" "$((i+1))" "${done_projects[$i]}"
+  done
+  read -rp "Enter number to regenerate config files, or press Enter for a new project: " regen_idx
+  if [[ -n "$regen_idx" ]]; then
+    if ! [[ "$regen_idx" =~ ^[0-9]+$ ]] || (( regen_idx < 1 || regen_idx > ${#done_projects[@]} )); then
+      echo "Invalid selection."; exit 1
+    fi
+    project_name="${done_projects[$((regen_idx-1))]}"
+    dst_dir="./rke2-config/${project_name}"
+
+    # Value column of 01 table by key (works with or without the No column)
+    v01() { awk -F'|' -v k="$1" '{for(i=2;i<NF;i++){f=$i; gsub(/^ +| +$/,"",f); if(f==k){v=$(i+1); gsub(/^ +| +$/,"",v); print v; exit}}}' "$dst_dir/01-rke2-config.txt"; }
+    # Quoted value of 'key: "..."' in 02 manifest
+    v02() { awk -v k="$1:" '$1==k {v=$0; sub(/^[^"]*"/,"",v); sub(/"$/,"",v); print v; exit}' "$dst_dir/02-additional-manifest.yaml"; }
+
+    USER_PASS=$(v02 password)
+    region_name=$(v02 region)
+    domain_name=$(v02 domain-name)
+    external_network_id=$(v02 floating-network-id)
+    network_subnet_id=$(v02 subnet-id)
+    shareNetworkID=$(v02 shareNetworkID)
+    external_network_name=$(v01 floatingPool)
+    image_name=$(v01 imageName)
+    network_id=$(v01 netId)
+    project_id=$(v01 tenantId)
+    user_id=$(v01 userId)
+
+    for v in USER_PASS region_name domain_name external_network_id network_subnet_id shareNetworkID \
+             external_network_name image_name network_id project_id; do
+      [[ -n "${!v}" ]] || { echo "ERROR: Could not read $v from $dst_dir. Press Enter at the prompt to run full generation."; exit 1; }
+    done
+
+    echo "Regenerating config files for project '$project_name' (no OpenStack CLI)."
+    write_files
+    exit 0
+  fi
+fi
+
 # --- Step 0: list regions & select (auto-pick if single) ---------------------
 echo "Select Region:"
 regions_json=$(openstack region list -c Region -f json)
@@ -228,67 +518,6 @@ ensure_flavor appfw.medium --vcpus 8  --ram 8192  --disk 200 --property hw:cpu_c
 ensure_flavor appfw.large  --vcpus 12 --ram 12288 --disk 200 --property hw:cpu_cores=12 --public
 ensure_flavor appfw.xlarge --vcpus 16 --ram 16384 --disk 200 --property hw:cpu_cores=16 --public
 
-# --- Step 7: output configuration & save to file (ASCII box, fixed order) ---
-echo
-outfile="${dst_dir}/01-rke2-config.txt"
-  
-# Ordered config (parallel arrays)
-keys=(
-  "password"
-  "activeTimeout"
-  "authUrl"
-  "endpointType"
-  "flavorName"
-  "floatingPool"
-  "imageName"
-  "insecure"
-  "ipVersion"
-  "netId"
-  "secGroup"
-  "sshPort"
-  "sshUser"
-  "tenantId"
-  "userId"
-)
-
-values=(
-  "$USER_PASS"
-  "200"
-  "${OS_AUTH_URL:-}"
-  "publicURL"
-  "appfw.medium"
-  "$external_network_name"
-  "$image_name"
-  "[v] checked"
-  "4"
-  "$network_id"
-  "default,default-k8s"
-  "22"
-  "ubuntu"
-  "$project_id"
-  "$user_id"
-)
-
-# Calculate max widths
-max_key=0
-max_val=0
-for i in "${!keys[@]}"; do
-  (( ${#keys[$i]} > max_key )) && max_key=${#keys[$i]}
-  (( ${#values[$i]} > max_val )) && max_val=${#values[$i]}
-done
-
-border="+-$(printf '%*s' "$max_key" '' | tr ' ' '-')-+-$(printf '%*s' "$max_val" '' | tr ' ' '-')-+"
-
-{
-  echo "$border"
-  printf "| %-*s | %-*s |\n" $max_key "Key" $max_val "Value"
-  echo "$border"
-  for i in "${!keys[@]}"; do
-    printf "| %-*s | %-*s |\n" $max_key "${keys[$i]}" $max_val "${values[$i]}"
-  done
-  echo "$border"
-} | tee "$outfile"
-
 # --- Step 8: ensure Manila share network for 'private-k8s' -------------------
 sn_name="${project_name}-private-k8s"
 
@@ -358,173 +587,4 @@ if [[ -z "${shareNetworkID:-}" ]]; then
   exit 1
 fi
 
-additional_manifest="${dst_dir}/02-additional-manifest.yaml"
-cat > "$additional_manifest" <<CC
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: openstack-cloud-controller-manager
-  annotations:
-    provisioningcattleiodriver: ""
-  finalizers: []
-  generatename: ""
-  labels: {}
-  managedfields: []
-  namespace: kube-system
-  ownerreferences: []
-  resourceversion: ""
-spec:
-  chart: openstack-cloud-controller-manager
-  repo: https://kubernetes.github.io/cloud-provider-openstack
-  targetNamespace: kube-system
-  bootstrap: true
-  valuesContent: |
-    nodeSelector:
-      node-role.kubernetes.io/control-plane: "true"
-    tolerations:
-      - key: node-role.kubernetes.io/etcd
-        operator: Exists
-        effect: NoExecute
-      - key: node-role.kubernetes.io/control-plane
-        operator: Exists
-        effect: NoSchedule
-      - key: node.cloudprovider.kubernetes.io/uninitialized
-        operator: Exists
-        effect: NoSchedule
-    secret:
-      create: true
-      name: cloud-config
-    cloudConfig:
-      global:
-        auth-url: "${OS_AUTH_URL:-}"
-        tenant-name: "${project_name}"
-        username: "${project_name}"
-        password: "${USER_PASS}"
-        region: "${region_name}"
-        domain-name: "${domain_name}"
-        tls-insecure: "true"
-      loadBalancer:
-        floating-network-id: "${external_network_id}"
-        subnet-id: "${network_subnet_id}"
-      blockStorage:
-        ignore-volume-az: true
----
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: openstack-cinder-csi
-  annotations:
-    provisioningcattleiodriver: ""
-  namespace: kube-system
-spec:
-  chart: openstack-cinder-csi
-  repo: https://kubernetes.github.io/cloud-provider-openstack
-  targetNamespace: kube-system
-  bootstrap: true
-  valuesContent: |
-    secret:
-      enabled: true
-      name: cloud-config
-    storageClass:
-      enabled: false
-      custom: |-
-        ---
-        apiVersion: storage.k8s.io/v1
-        kind: StorageClass
-        metadata:
-          annotations:
-            storageclass.kubernetes.io/is-default-class: "true"
-          name: csi-cinder
-        provisioner: cinder.csi.openstack.org
-        allowVolumeExpansion: true
-        ---
-        apiVersion: snapshot.storage.k8s.io/v1
-        kind: VolumeSnapshotClass
-        metadata:
-          name: csi-cinder-snapclass
-        driver: cinder.csi.openstack.org
-        deletionPolicy: Delete
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: csi-manila-secrets
-  namespace: kube-system
-stringData:
-  os-authURL: "${OS_AUTH_URL:-}"
-  os-region: "${region_name}"
-  os-domainName: "${domain_name}"
-  os-userName: "${project_name}"
-  os-password: "${USER_PASS}"
-  os-projectName: "${project_name}"
-  os-TLSInsecure: "true"
----
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: csi-driver-nfs
-  annotations:
-    provisioningcattleiodriver: ""
-  namespace: kube-system
-spec:
-  chart: csi-driver-nfs
-  repo: https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
-  targetNamespace: kube-system
-  bootstrap: true
-  valuesContent: |
-    externalSnapshotter:
-      enabled: false
----
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: openstack-manila-csi
-  annotations:
-    provisioningcattleiodriver: ""
-  namespace: kube-system
-spec:
-  chart: openstack-manila-csi
-  repo: https://kubernetes.github.io/cloud-provider-openstack
-  targetNamespace: kube-system
-  bootstrap: true
-  valuesContent: |
-    storageClass:
-      enabled: false
-      custom: |-
----
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: csi-manila-nfs
-provisioner: nfs.manila.csi.openstack.org
-allowVolumeExpansion: true
-parameters:
-  type: tenant_share_type
-  shareNetworkID: "${shareNetworkID}"
-  csi.storage.k8s.io/provisioner-secret-name: csi-manila-secrets
-  csi.storage.k8s.io/provisioner-secret-namespace: kube-system
-  csi.storage.k8s.io/controller-expand-secret-name: csi-manila-secrets
-  csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
-  csi.storage.k8s.io/node-stage-secret-name: csi-manila-secrets
-  csi.storage.k8s.io/node-stage-secret-namespace: kube-system
-  csi.storage.k8s.io/node-publish-secret-name: csi-manila-secrets
-  csi.storage.k8s.io/node-publish-secret-namespace: kube-system
-CC
-
-edit_cluster="${dst_dir}/03-edit-cluster.yaml"
-cat > "$edit_cluster" <<CCEY
-    machineSelectorConfig:
-      - config: 
-          disable-cloud-controller: true
-          kubelet-arg:
-            - cloud-provider=external
-          protect-kernel-defaults: false
-CCEY
-
-cubectl node -r control rsync rke2-config
-
-echo
-echo "Config files written:"
-echo "- $outfile"
-echo "- $additional_manifest"
-echo "- $edit_cluster"
+write_files
