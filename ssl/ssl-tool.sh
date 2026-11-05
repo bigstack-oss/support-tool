@@ -6,20 +6,21 @@ umask 077
 fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 usage() {
  cat <<'HELP'
-Usage: ssl-tool.sh [--pass-env NAME] [--out-pass-env NAME] [--legacy] COMMAND
-  inspect FILE [-t]
-  match FILE FILE [FILE...]
-  verify CERT | verify -d DIR | -v -d DIR
-  pfx-extract FILE -d DIR [-k] [-u]
-  pfx-create --cert FILE --key FILE [--chain FILE] -o NEW_FILE
+Usage: ssl-tool.sh
+  -i FILE [-t]                            (inspect)
+  -m FILE FILE [FILE...]                  (match)
+  -v -d DIR                               (verify)
+  -x FILE -d DIR                          (pfx-extract; writes unencrypted private.key)
+  -c -d DIR -o NEW_FILE                   (pfx-create)
   convert FILE -f PEM|DER -o NEW_FILE
-  -k includes the private key; -u exports it unencrypted.
-  -d, -k, -u, -o, -t, and -f are short forms; long forms remain supported.
+  --url URL                               (show server certificate from curl)
 Passwords are prompted unless environment variable names are supplied.
 HELP
 }
 command -v openssl >/dev/null || fail 'openssl required'
 PASS_ENV= OUT_PASS_ENV= LEGACY=0
+URL=
+COMMAND=
 while [[ $# -gt 0 ]]; do
  case $1 in
  --pass-env|--out-pass-env)
@@ -27,13 +28,22 @@ while [[ $# -gt 0 ]]; do
   [[ $2 =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail 'Invalid variable name'
   printenv "$2" >/dev/null || fail "Unset variable: $2"
   if [[ $1 == --pass-env ]]; then PASS_ENV=$2; else OUT_PASS_ENV=$2; fi; shift 2;;
+ --url)
+  [[ $# -ge 2 && -n $2 ]] || fail 'Usage: --url URL'
+  URL=$2; COMMAND=url; shift 2; break;;
  --legacy) LEGACY=1; shift;;
  --help|-h) usage; exit 0;;
  *) break;; esac
 done
-[[ $# -gt 0 ]] || { usage; exit 2; }
-COMMAND=$1; shift
+if [[ $COMMAND != url ]]; then
+ [[ $# -gt 0 ]] || { usage; exit 2; }
+ COMMAND=$1; shift
+fi
 [[ $COMMAND != -v ]] || COMMAND=verify
+[[ $COMMAND != -x ]] || COMMAND=pfx-extract
+[[ $COMMAND != -c ]] || COMMAND=pfx-create
+[[ $COMMAND != -i ]] || COMMAND=inspect
+[[ $COMMAND != -m ]] || COMMAND=match
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ssl-tool.XXXXXX")
 PUBLISH_TMP=
 cleanup() {
@@ -285,6 +295,27 @@ publish_replace() {
  PUBLISH_TMP=
 }
 case $COMMAND in
+url)
+ command -v curl >/dev/null || fail 'curl required for --url'
+ if curl -ivk --url "$URL" -o /dev/null 2>"$TMP/curl.log"; then
+  CURL_STATUS=0
+ else
+  CURL_STATUS=$?
+ fi
+ if ! awk '
+  /^\* Server certificate:/ { printing=1; found=1; print; next }
+  printing {
+   if ($0 ~ /^\*  (subject|start date|expire date|issuer):/ ||
+       $0 ~ /^\* .*certificate verify result:/ ||
+       $0 ~ /^\*   Certificate level [0-9]+:/) print
+   else exit
+  }
+  END { if (!found) exit 1 }
+ ' "$TMP/curl.log"; then
+  fail "curl did not return a Server certificate section (exit code $CURL_STATUS)"
+ fi
+ [[ $CURL_STATUS == 0 ]] || fail "curl failed after returning the server certificate (exit code $CURL_STATUS)"
+ ;;
 inspect)
  [[ $# -ge 1 && $# -le 2 ]] || fail 'inspect FILE [-t]'
  FILE=$1; TEXT=0
@@ -328,48 +359,118 @@ verify)
  verify_target "$TARGET";;
 pfx-extract)
  [[ $# -ge 1 ]] || fail 'Missing PFX'
- FILE=$1; shift; DEST=; INCLUDE=0; PLAIN=0
+ FILE=$1; shift; DEST=
  while [[ $# -gt 0 ]]; do
   case $1 in
   -d|--out-dir) [[ $# -ge 2 ]] || fail 'Missing directory'; DEST=$2; shift 2;;
-  -k|--include-key) INCLUDE=1; shift;; -u|--unencrypted-key) PLAIN=1; shift;;
   *) fail "Unknown option $1";; esac
  done
  [[ -n $DEST ]] || fail 'Missing -d/--out-dir'
- [[ $PLAIN == 0 || $INCLUDE == 1 ]] || fail '-u/--unencrypted-key requires -k/--include-key'
  if [[ -e $DEST || -L $DEST ]]; then
   [[ -d $DEST ]] || fail 'Output path exists and is not a directory'
-  for output in leaf.crt chain.crt; do
+  for output in server.crt chain.crt fullchain.crt; do
    [[ ! -d $DEST/$output ]] || fail "Output path is a directory: $DEST/$output"
   done
-  if [[ $INCLUDE == 1 ]]; then
-   [[ ! -d $DEST/private.key ]] || fail "Output path is a directory: $DEST/private.key"
-  fi
+  [[ ! -d $DEST/leaf.crt ]] || fail "Output path is a directory: $DEST/leaf.crt"
+  [[ ! -d $DEST/private.key ]] || fail "Output path is a directory: $DEST/private.key"
  else
   DEST_NEW=1
  fi
  read_p12_password
- p12cmd -in "$FILE" -clcerts -nokeys > "$TMP/leaf.crt"
+ p12cmd -in "$FILE" -clcerts -nokeys > "$TMP/server.crt"
  p12cmd -in "$FILE" -cacerts -nokeys > "$TMP/chain.crt"
- if [[ $INCLUDE == 1 ]]; then
-  if [[ $PLAIN == 1 ]]; then p12cmd -in "$FILE" -nocerts -nodes > "$TMP/private.key"
-  else p12out -in "$FILE" -nocerts > "$TMP/private.key"; fi
- fi
+ cat -- "$TMP/server.crt" "$TMP/chain.crt" > "$TMP/fullchain.crt"
+ p12cmd -in "$FILE" -nocerts -nodes > "$TMP/private.key"
+ grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$TMP/private.key" || fail 'No private key found in PFX'
  [[ ${DEST_NEW:-0} == 0 ]] || mkdir -m 700 -- "$DEST"
- publish_replace "$TMP/leaf.crt" "$DEST/leaf.crt"; publish_replace "$TMP/chain.crt" "$DEST/chain.crt"
- [[ $INCLUDE == 0 ]] || publish_replace "$TMP/private.key" "$DEST/private.key"
+ publish_replace "$TMP/server.crt" "$DEST/server.crt"
+ publish_replace "$TMP/chain.crt" "$DEST/chain.crt"
+ publish_replace "$TMP/fullchain.crt" "$DEST/fullchain.crt"
+ publish_replace "$TMP/private.key" "$DEST/private.key"
+ [[ ! -f $DEST/leaf.crt && ! -L $DEST/leaf.crt ]] || rm -f -- "$DEST/leaf.crt"
+ [[ ! -f $DEST/leaf.crt && ! -L $DEST/leaf.crt ]] || rm -f -- "$DEST/leaf.crt"
  echo "Extracted to $DEST; chain may be empty.";;
 pfx-create)
- CERT=; KEY=; CHAIN=; OUT=
+ SOURCE_DIR=; OUT=
  while [[ $# -gt 0 ]]; do
   [[ $# -ge 2 ]] || fail 'Missing option value'
-  case $1 in --cert) CERT=$2;; --key) KEY=$2;; --chain) CHAIN=$2;; -o|--out) OUT=$2;; *) fail "Unknown option $1";; esac; shift 2
+  case $1 in -d) SOURCE_DIR=$2;; -o|--out) OUT=$2;; *) fail "Unknown option $1";; esac; shift 2
  done
- [[ -n $CERT && -n $KEY && -n $OUT && ! -e $OUT ]] || fail 'Requires --cert --key -o/--out (new file)'
- A=$(pubhash "$CERT") || fail 'Invalid certificate'; B=$(pubhash "$KEY") || fail 'Invalid key'
- [[ $A == "$B" ]] || fail 'Certificate/key mismatch'
- ARGS=(-export -in "$CERT" -inkey "$KEY")
- [[ -z $CHAIN ]] || ARGS+=(-certfile "$CHAIN")
+ [[ -n $SOURCE_DIR && -d $SOURCE_DIR && -r $SOURCE_DIR ]] || fail 'Requires -d DIR (readable directory)'
+ [[ -n $OUT && ! -e $OUT ]] || fail 'Requires -o NEW_FILE (output must not exist)'
+ find "$SOURCE_DIR" -type f -print0 > "$TMP/create-files" || fail "Cannot scan directory: $SOURCE_DIR"
+ CREATE_CERTS=() CREATE_CERT_HASHES=() CREATE_KEYS=() CREATE_KEY_HASHES=()
+ source= cert_file= key_file= key_hash= file_count=0 cert_hash= match_index=-1 match_count=0 index= duplicate=0
+ while IFS= read -r -d '' source; do
+  file_count=$((file_count + 1))
+  if [[ ! -r $source ]]; then
+   printf '[SKIP] unreadable file: %s\n' "$source" >&2
+   continue
+  fi
+  if [[ ! -s $source ]]; then
+   printf '[SKIP] empty file: %s\n' "$source" >&2
+   continue
+  fi
+  if ! detect "$source"; then
+   printf '[SKIP] unsupported file: %s\n' "$source" >&2
+   continue
+  fi
+  case $KIND in
+  cert|p7b)
+   if load_certs "$source" "$TMP/create-source-$file_count.pem" &&
+      split_certs "$TMP/create-source-$file_count.pem" "create-$file_count"; then
+    for cert_file in "$TMP"/create-"$file_count"-*.pem; do
+     [[ -f $cert_file ]] || continue
+     cert_hash=$(pubhash "$cert_file") || fail "Invalid certificate: $source"
+     duplicate=0
+     for index in "${!CREATE_CERTS[@]}"; do
+      if [[ ${CREATE_CERT_HASHES[$index]} == "$cert_hash" ]]; then duplicate=1; break; fi
+     done
+     if [[ $duplicate == 0 ]]; then
+      CREATE_CERTS+=("$cert_file")
+      CREATE_CERT_HASHES+=("$cert_hash")
+     fi
+    done
+   else
+    case $source in *.crt|*.CRT|*.cer|*.CER|*.der|*.DER|*.p7b|*.P7B)
+     fail "Invalid certificate input: $source";;
+    esac
+   fi;;
+  key)
+   if keycmd -inform "$FORMAT" -in "$source" -check -out "$TMP/create-key-$file_count.pem" >/dev/null &&
+      grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$TMP/create-key-$file_count.pem"; then
+    CREATE_KEYS+=("$TMP/create-key-$file_count.pem")
+    key_hash=$(pubhash "$TMP/create-key-$file_count.pem") || fail "Cannot read private key: $source"
+    CREATE_KEY_HASHES+=("$key_hash")
+   else
+    case $source in
+    *.crt|*.CRT|*.cer|*.CER|*.der|*.DER|*.p7b|*.P7B)
+     fail "Invalid certificate input: $source";;
+    *.key|*.KEY) fail "Invalid private key: $source";;
+    esac
+   fi;;
+  esac
+ done < "$TMP/create-files"
+ [[ ${#CREATE_KEYS[@]} == 1 ]] || fail "Expected exactly one valid private key in $SOURCE_DIR; found ${#CREATE_KEYS[@]}"
+ [[ ${#CREATE_CERTS[@]} -gt 0 ]] || fail "No X.509 certificates found in $SOURCE_DIR"
+ key_file=${CREATE_KEYS[0]}
+ key_hash=${CREATE_KEY_HASHES[0]}
+ for index in "${!CREATE_CERTS[@]}"; do
+  cert_file=${CREATE_CERTS[$index]}
+  cert_hash=${CREATE_CERT_HASHES[$index]}
+  if [[ $cert_hash == "$key_hash" ]]; then
+   match_index=$index
+   match_count=$((match_count + 1))
+  fi
+ done
+ [[ $match_count == 1 ]] || fail "Expected exactly one certificate matching the private key; found $match_count"
+ cat -- "${CREATE_CERTS[$match_index]}" > "$TMP/create-leaf.pem"
+ : > "$TMP/create-chain.pem"
+ for index in "${!CREATE_CERTS[@]}"; do
+  [[ $index == "$match_index" ]] || cat -- "${CREATE_CERTS[$index]}" >> "$TMP/create-chain.pem"
+ done
+ ARGS=(-export -in "$TMP/create-leaf.pem" -inkey "$key_file")
+ [[ ! -s $TMP/create-chain.pem ]] || ARGS+=(-certfile "$TMP/create-chain.pem")
  p12out "${ARGS[@]}" > "$TMP/result.pfx"
  publish "$TMP/result.pfx" "$OUT"; echo "Created $OUT";;
 convert)
