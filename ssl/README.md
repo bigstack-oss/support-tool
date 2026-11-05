@@ -20,7 +20,7 @@ TOOL=/Users/Roy/agent-smith/support-tool/ssl/ssl-tool.sh
 支援 PEM/DER X.509、CSR、私鑰、PKCS#7、PFX/P12（後者需 .pfx/.p12 副檔名）。不包含 JKS/SSH key。
 inspect 逐張顯示 leaf/中繼憑證資訊；私鑰僅顯示公鑰。CSR 沒有有效期或簽發者。
 match 使用 DER 公鑰 SHA-256，支援 RSA/EC；不使用 MD5/modulus。fullchain/PFX 比較第一張憑證，請確認 leaf 排第一。PFX 內私鑰若要驗證，先匯出再 match。
-verify 可指定單一憑證檔或目錄；目錄會遞迴掃描。`-v -d DIR` 是 `verify -d DIR` 的簡寫。每張憑證會列出 Subject、Issuer/CA provider、序號、有效起訖時間和所有 SAN 項目（包括 DNS 網域及 IP），每個檔案只顯示一個彙總驗證結果（例如 `3/3 certificates`）。它會用 OpenSSL 系統信任庫檢查簽章鏈，leaf 憑證會以 TLS server 用途驗證；CA 憑證作為鏈憑證驗證。目錄中的 PEM、DER、PKCS#7、PFX/P12 檔案會檢查，其他檔案列為略過；若任一憑證失敗，命令會以非零狀態結束。請將 leaf 與所需中繼憑證放在同一 fullchain，或一起放在掃描目錄中。此簡化模式不接受自訂 CA 或 hostname；不查 OCSP/CRL、不下載 AIA、不檢查線上服務。
+verify 可指定單一憑證檔或目錄；目錄會遞迴掃描。`-v -d DIR` 是 `verify -d DIR` 的簡寫。每張憑證會列出 Subject、Issuer/CA provider、序號、有效起訖時間和所有 SAN 項目（包括 DNS 網域及 IP），每個檔案只顯示一個彙總驗證結果（例如 `3/3 certificates`）。它會用 OpenSSL 系統信任庫檢查簽章鏈，leaf 憑證會以 TLS server 用途驗證；CA 憑證作為鏈憑證驗證。遇到 PFX/P12 時只詢問一次解密密碼，並重用於本次掃描；非互動可用全域 `--pass-env NAME`。目錄中的 PEM、DER、PKCS#7、PFX/P12 檔案會檢查，其他檔案列為略過；若任一憑證失敗，命令會以非零狀態結束。請將 leaf 與所需中繼憑證放在同一 fullchain，或一起放在掃描目錄中。此簡化模式不接受自訂 CA 或 hostname；不查 OCSP/CRL、不下載 AIA、不檢查線上服務。
 
 ## PFX 匯出與建立
 
