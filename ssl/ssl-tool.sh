@@ -8,7 +8,6 @@ usage() {
  cat <<'HELP'
 Usage: ssl-tool.sh
   -i FILE [-t]                            (inspect)
-  -m FILE FILE [FILE...]                  (match)
   -v -d DIR                               (verify)
   -x FILE -d DIR                          (pfx-extract; writes unencrypted private.key)
   -c -d DIR -o NEW_FILE                   (pfx-create)
@@ -43,7 +42,6 @@ fi
 [[ $COMMAND != -x ]] || COMMAND=pfx-extract
 [[ $COMMAND != -c ]] || COMMAND=pfx-create
 [[ $COMMAND != -i ]] || COMMAND=inspect
-[[ $COMMAND != -m ]] || COMMAND=match
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ssl-tool.XXXXXX")
 PUBLISH_TMP=
 cleanup() {
@@ -134,7 +132,7 @@ is_ca_cert() {
  fi
 }
 print_cert_details() {
- local cert=$1 label=$2 details san
+ local cert=$1 label=$2 details san fingerprint
  if ! details=$(openssl x509 -in "$cert" -noout -subject -issuer -serial -startdate -enddate -nameopt RFC2253); then
   return 1
  fi
@@ -157,11 +155,15 @@ print_cert_details() {
  else
   printf '  Subject alternative names: (none)\n'
  fi
+ fingerprint=$(openssl x509 -in "$cert" -noout -fingerprint -md5) || return 1
+ printf '  MD5 fingerprint: %s\n' "${fingerprint#*=}"
 }
 verify_target() {
- local target=$1 source prefix cert index
+ local target=$1 source prefix cert index cert_hash key_hash hash_index
  local skipped=0 scan_failures=0 file_count=0
  local -a verify_files=() verify_certs=() verify_ca=()
+ local -a key_files=() key_hashes=() key_matched=()
+ local -a hash_files=() hash_values=()
  : > "$TMP/directory-certs.pem"
  if [[ -d $target ]]; then
   find "$target" -type f -print0 > "$TMP/scan-files" || fail "Cannot scan directory: $target"
@@ -178,7 +180,20 @@ verify_target() {
     scan_failures=$((scan_failures + 1))
     continue
    fi
-   case $KIND in cert|pfx|p7b) ;;
+   case $KIND in
+   cert|pfx|p7b) ;;
+   key)
+    if key_hash=$(pubhash "$source"); then
+     key_files+=("$source")
+     key_hashes+=("$key_hash")
+     key_matched+=(0)
+     hash_files+=("${source##*/}")
+     hash_values+=("$key_hash")
+    else
+     printf '[FAIL] %s: cannot parse private key or read its public key\n' "$source"
+     scan_failures=$((scan_failures + 1))
+    fi
+    continue;;
    *)
     case $source in
     *.crt|*.CRT|*.cer|*.CER|*.der|*.DER|*.p7b|*.P7B|*.pfx|*.PFX|*.p12|*.P12)
@@ -204,6 +219,15 @@ verify_target() {
    for cert in "$TMP/$prefix"-*.pem; do
     [[ -f $cert ]] || continue
     index=$((index + 1))
+    if [[ $index == 1 ]]; then
+     cert_hash=$(pubhash "$cert") || {
+      printf '[FAIL] %s: cannot read certificate public key\n' "$source"
+      scan_failures=$((scan_failures + 1))
+      continue
+     }
+     hash_files+=("${source##*/}")
+     hash_values+=("$cert_hash")
+    fi
     is_ca_cert "$cert"
     verify_files+=("$source")
     verify_certs+=("$cert")
@@ -221,6 +245,11 @@ verify_target() {
   for cert in "$TMP"/input-*.pem; do
    [[ -f $cert ]] || continue
    index=$((index + 1))
+   if [[ $index == 1 ]]; then
+    cert_hash=$(pubhash "$cert") || fail "Cannot read certificate public key: $target"
+    hash_files+=("${target##*/}")
+    hash_values+=("$cert_hash")
+   fi
    is_ca_cert "$cert"
    verify_files+=("$target")
    verify_certs+=("$cert")
@@ -232,7 +261,7 @@ verify_target() {
   printf 'Summary: 0 certificate(s) passed, %d failed, %d unsupported file(s) skipped.\n' "$scan_failures" "$skipped"
   fail "No supported certificates found in $target"
  fi
- local passed=0 failed=$scan_failures purpose label file_passed file_failed file_total cert_number
+ local passed=0 failed=$scan_failures purpose label file_passed file_failed file_total cert_number key_index
  index=0
  while [[ $index -lt ${#verify_certs[@]} ]]; do
   source=${verify_files[$index]}
@@ -248,6 +277,19 @@ verify_target() {
     index=$((index + 1))
     continue
    fi
+   cert_hash=$(pubhash "${verify_certs[$index]}") || {
+    printf '[FAIL] %s: cannot read certificate public key\n' "$label"
+    file_failed=$((file_failed + 1))
+    failed=$((failed + 1))
+    index=$((index + 1))
+    continue
+   }
+   for key_index in "${!key_files[@]}"; do
+    if [[ ${key_hashes[$key_index]} == "$cert_hash" ]]; then
+     printf '  [MATCH] private key: %s\n' "${key_files[$key_index]}"
+     key_matched[$key_index]=1
+    fi
+   done
    purpose=sslserver
    [[ ${verify_ca[$index]} == 0 ]] || purpose=any
    ARGS=(verify -purpose "$purpose" -untrusted "$TMP/directory-certs.pem")
@@ -265,6 +307,15 @@ verify_target() {
    printf '[PASS] %s (%d/%d certificates)\n' "$source" "$file_passed" "$file_total"
   else
    printf '[FAIL] %s (%d/%d certificates passed)\n' "$source" "$file_passed" "$file_total"
+  fi
+ done
+ for hash_index in "${!hash_files[@]}"; do
+  printf '%s  %s\n' "${hash_values[$hash_index]}" "${hash_files[$hash_index]}"
+ done
+ for key_index in "${!key_files[@]}"; do
+  if [[ ${key_matched[$key_index]} == 0 ]]; then
+   printf '[MISMATCH] %s: no matching certificate found\n' "${key_files[$key_index]}"
+   failed=$((failed + 1))
   fi
  done
  printf 'Summary: %d certificate(s) passed, %d failed, %d unsupported file(s) skipped.\n' "$passed" "$failed" "$skipped"
@@ -336,15 +387,6 @@ inspect)
   keycmd -in "$FILE" -inform "$FORMAT" -pubout > "$TMP/key-public.pem"
   openssl pkey -pubin -in "$TMP/key-public.pem" -text -noout
   openssl pkey -pubin -in "$TMP/key-public.pem" -outform DER | openssl dgst -sha256;; esac;;
-match)
- [[ $# -ge 2 ]] || fail 'Provide at least two files'
- FIRST=; SAME=1
- for f in "$@"; do
-  HASH=$(pubhash "$f") || fail "Cannot parse $f"
-  printf '%s  %s\n' "$HASH" "$f"
-  if [[ -z $FIRST ]]; then FIRST=$HASH; elif [[ $HASH != "$FIRST" ]]; then SAME=0; fi
- done
- [[ $SAME == 1 ]] || { echo MISMATCH; exit 1; }; echo MATCH;;
 verify)
  TARGET=
  while [[ $# -gt 0 ]]; do
