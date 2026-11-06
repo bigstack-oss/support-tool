@@ -237,7 +237,9 @@ kc() {  # kc METHOD PATH [curl args] -> response body
     tok=$(curl -s --fail --cacert "$KC_CA" -d client_id=admin-cli -d username=admin --data-urlencode "password@$WORK/kc.pw" \
         -d grant_type=password "$KC/realms/master/protocol/openid-connect/token" | jq -r .access_token) || tok=""
     [[ -n $tok && $tok != null ]] || { echo "Keycloak admin login failed ($KC)" >&2; return 1; }
-    curl -s --fail-with-body --cacert "$KC_CA" -X "$m" -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+    # admin token via a mode-600 header file, not argv (ps would show it to every local user)
+    ( umask 077; printf 'Authorization: Bearer %s\n' "$tok" > "$WORK/kc.hdr" )
+    curl -s --fail-with-body --cacert "$KC_CA" -X "$m" -H @"$WORK/kc.hdr" -H 'Content-Type: application/json' \
         "$KC/admin/realms/master$p" "$@"
 }
 kc_find() { kc GET /clients -G --data-urlencode "clientId=$1" | jq -c '.[0] // empty'; }
