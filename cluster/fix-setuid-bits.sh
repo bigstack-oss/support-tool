@@ -76,10 +76,10 @@ REFERENCE_FILES=(
   "/usr/sbin/usernetctl:4755"
   "/usr/sbin/grub2-set-bootflag:4755"
   "/usr/sbin/mount.nfs:4755"
-  # Vendor binaries, not owned by any RPM package (verified via peer comparison)
   "/usr/bin/nvidia-modprobe:4755"
   "/usr/sbin/hex_config:4755"
   "/usr/sbin/hex_firsttime:4755"
+  "/usr/local/bin/cubectl:4755"
 )
 
 log() { printf '%s\n' "$*"; }
