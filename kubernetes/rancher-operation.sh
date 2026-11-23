@@ -24,8 +24,8 @@ Usage: bash rancher-operation.sh <--watch|--cleanup|--connect|--repo|--download|
              MACHINE: list and ask for a number. Takes the machine's SSH key
              (secret <machine>-machine-state, as the UI "Download SSH Key") to
              KEY_DIR/<machine>-id_rsa (600, KEY_DIR private), the VM's floating IP (openstack
-             server list --all-projects --name <machine>; none: the IP Rancher
-             uses), sshUser/sshPort of its OpenstackMachine. Host key pinned on
+             server by its ID from machine-state; none: the IP Rancher
+             uses), sshUser/sshPort of its OpenstackMachine (format-checked). Host key pinned on
              first connect in KEY_DIR/<machine>-known_hosts. k8s-status.sh (next
              to this script, K8S_STATUS overrides) is copied to the VM's home
              first. COMMAND after --
@@ -86,6 +86,7 @@ start_log() {
   { mkdir -p "$LOG_DIR" && touch "$LOG_DIR/.w" && rm -f "$LOG_DIR/.w"; } 2>/dev/null \
     || { echo "WARN: $LOG_DIR not writable; no log file" >&2; return 0; }
   LOG_FILE=$LOG_DIR/rancher-operation-$1-$(date +%Y%m%d-%H%M%S).log
+  ( umask 077; : >> "$LOG_FILE" )                     # logs hold cluster details: owner-only
   exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)   # stderr stays stderr
   echo "log: $LOG_FILE"
 }
@@ -187,13 +188,13 @@ stale_sets() {
        ([$m.items[] | select(.metadata.labels["cluster.x-k8s.io/set-name"] == $set and .status.nodeRef != null)] | length)] | @tsv'
 }
 
-# "key: old -> new" for every template field that differs; credentials masked.
+# "key: old -> new" for every template field that differs; credentials, certificates and user data masked.
 template_diff() {
   local kind=$1 a b
   a=$(k -n "$NS" get "$kind" "$2" -o json) && b=$(k -n "$NS" get "$kind" "$3" -o json) || { echo "(cannot read templates)"; return 0; }
   jq -rn --argjson a "$a" --argjson b "$b" '($a.spec.template.spec // {}) as $o | ($b.spec.template.spec // {}) as $n
     | ([$o, $n] | map(keys) | add | unique)[] as $k | select($o[$k] != $n[$k])
-    | if ($k | test("password|secret|token"; "i")) then "\($k): *** -> ***"
+    | if ($k | test("password|secret|token|cred|cert|privatekey|userdata"; "i")) then "\($k): *** -> ***"
       else "\($k): \($o[$k] | tojson) -> \($n[$k] | tojson)" end'
 }
 
@@ -253,20 +254,25 @@ machine_file() {
     | tar xzO --wildcards "*/machines/$1/$2" 2>/dev/null
 }
 
-# Floating IP of the OpenStack server named like the machine (admin, all projects).
+# Floating IP of the machine's OpenStack server. $1 = server ID (Driver.MachineId), $2 = machine name,
+# $3 = project (Driver.TenantId). By ID when known; a name search must match exactly one server.
 floating_ip() {
-  local id p
+  local id=${1:-} p ids n
   if [[ -z ${OS_AUTH_URL:-} && -r ${OPENRC:-/etc/admin-openrc.sh} ]]; then source "${OPENRC:-/etc/admin-openrc.sh}"; fi
   command -v openstack >/dev/null || return 0
-  id=$(openstack server list --all-projects --name "^$1\$" -f value -c ID 2>/dev/null | head -1)
-  [[ -n $id ]] || return 0
+  if [[ -z $id ]]; then
+    ids=$(openstack server list --all-projects ${3:+--project "$3"} --name "^$2\$" -f value -c ID 2>/dev/null)
+    n=$(grep -c . <<< "$ids")
+    if (( n != 1 )); then echo "WARN: $n OpenStack servers named $2${3:+ in project $3}; not guessing the floating IP" >&2; return 0; fi
+    id=$ids
+  fi
   for p in $(openstack port list --server "$id" -f value -c ID 2>/dev/null); do
     openstack floating ip list --port "$p" -f value -c "Floating IP Address" 2>/dev/null
   done | head -1
 }
 
 connect_main() {
-  local pos=() c m key tmp cfg ref user port ip st
+  local pos=() c m key tmp cfg ref user port ip st dest
   while (( $# )) && [[ $1 != -- ]]; do pos+=("$1"); shift; done   # CLUSTER MACHINE
   [[ ${1:-} == -- ]] && shift                                      # the rest is the remote command
   c=${pos[0]:-}; m=${pos[1]:-}
@@ -293,24 +299,30 @@ connect_main() {
   [[ -n $port ]] || port=$(jq -r '.Driver.SSHPort // empty' <<< "$cfg" 2>/dev/null)
   user=${user:-root}; port=${port:-22}
 
-  ip=$(floating_ip "$m")
+  ip=$(floating_ip "$(jq -r '.Driver.MachineId // empty' <<< "$cfg" 2>/dev/null)" "$m" \
+    "$(jq -r '.Driver.TenantId // empty' <<< "$cfg" 2>/dev/null)")
   if [[ -z $ip ]]; then
     ip=$(jq -r '.Driver.IPAddress // empty' <<< "$cfg" 2>/dev/null)
     [[ -n $ip ]] && echo "No floating IP found for $m; using the IP Rancher uses: $ip" >&2
   fi
   [[ -n $ip ]] || die "no IP for $m (no floating IP, no driver IPAddress)"
+  # These come from cluster objects: never let them turn into ssh options.
+  [[ $user =~ ^[a-z_][a-z0-9_.-]*$ ]] || die "refusing sshUser '$user' for $m"
+  [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "refusing sshPort '$port' for $m"
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $ip =~ ^[0-9a-fA-F:]+:[0-9a-fA-F:]*$ ]] || die "refusing IP '$ip' for $m"
+  dest=$ip; [[ $ip == *:* ]] && dest="[$ip]"         # IPv6 needs brackets in scp's host:path
 
   echo "$m: $user@$ip:$port  key $key"
   # Ship the node check so it is ready on the VM (sudo bash k8s-status.sh); a failed copy does not block the login.
   st=${K8S_STATUS:-$(dirname "${BASH_SOURCE[0]}")/k8s-status.sh}
   if [[ ! -r $st ]]; then echo "WARN: $st not found; not copied to the VM" >&2
-  elif scp -q -i "$key" -P "$port" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" \
-      "$st" "$user@$ip:k8s-status.sh"; then echo "copied k8s-status.sh to ~$user/ (run: sudo bash k8s-status.sh)"
+  elif scp -q -i "$key" -P "$port" -o User="$user" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" \
+      -- "$st" "$dest:k8s-status.sh"; then echo "copied k8s-status.sh to ~$user/ (run: sudo bash k8s-status.sh)"
   else echo "WARN: scp of $st to $user@$ip failed; connecting anyway" >&2; fi
   { mkdir -p "$LOG_DIR" && echo "$(date '+%F %T') $(id -un) $c $m $user@$ip:$port $*" >> "$LOG_DIR/rancher-node-connect.log"; } 2>/dev/null
   # Host key: trusted on first use, pinned per machine. A rebuilt VM is a new machine name (new file), so only a key
   # change on the same VM fails, as it should.
-  exec ssh -i "$key" -p "$port" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" "$user@$ip" "$@"
+  exec ssh -i "$key" -p "$port" -l "$user" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" -- "$ip" "$@"
 }
 
 # ============================================================ --repo
