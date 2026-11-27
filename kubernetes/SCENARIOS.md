@@ -37,6 +37,8 @@ controller 端每次執行的輸出都存在 `/var/log/kubernetes/`。
 | 8 | VM | 要不要離線、能不能線上安裝 | `k8s-status.sh --net` |
 | 9 | CubeCOS | 要 SSH 進某台 VM | `--connect` |
 | 10 | VM → CubeCOS | 為下一個站點預先準備 image | VM `--used` → `--download` / `--upload` |
+| 11 | CubeCOS | App Framework create 卡在 `waiting for all pods to be ready`（`helm-operation-*` 停在 `Running 1/2`） | `--watch` → `--cleanup` |
+| 12 | CubeCOS → VM | 同一個指令 / 腳本要在多台（或全部）節點跑 | `--node-cmd` |
 
 「在哪」：**CubeCOS** = CubeCOS controller（`rancher-operation.sh`）；**VM** = 下游 cluster 的節點內（`sudo bash k8s-status.sh`）；**VM → CubeCOS** = 先在 VM 找出問題，再到 controller 處理。
 
@@ -445,6 +447,7 @@ bash rancher-operation.sh --connect <cluster> <machine> -- sudo bash k8s-status.
 - 自動取 SSH 金鑰（secret `<machine>-machine-state`，等同 UI 的 Download SSH Key）、找 FIP（`openstack server list --all-projects`）、取 `sshUser`。
 - 每次連線前把 `k8s-status.sh` 複製到 VM 家目錄。
 - 金鑰在 `/tmp/rancher-keys-<uid>/`（目錄 700），用完可 `rm -rf /tmp/rancher-keys-$(id -u)`。
+- 要對多台一次執行，用場景 12 的 `--node-cmd`。
 
 ## 10. (VM → CubeCOS) 為下一個站點預先準備 image
 
@@ -478,6 +481,85 @@ bash rancher-operation.sh --verify used-images.txt
 
 再加上新站點會用到但這個 cluster 沒用到的元件（例如不同 CNI、GPU Operator 的 `gpu-operator-images.txt`）。
 
+## 11. (CubeCOS) App Framework create 卡在 `waiting for all pods to be ready`
+
+`/var/log/appctl/appctl.log` 停在 `kubernetes: waiting for all pods to be ready ...` 很久沒動（appctl 會等 60 分鐘後失敗，錯誤訊息寫成 `after 2400 seconds`）。
+
+常見原因：Rancher 同時跑兩個 `helm upgrade` 搶同一個 release（例如 `rancher-webhook`），輸的那個 `helm-operation-*` pod 的 `helm` container 結束了（`Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress`），但 `proxy` sidecar 不結束，pod 永遠停在 `Running 1/2`，appctl 一直等它 ready。
+
+**CubeCOS**：看有沒有卡住的 helm operation（`--watch` 會 WARN 一次）
+
+```bash
+bash rancher-operation.sh --watch <cluster> --once
+```
+
+```text
+08:12:01 [WARN ] helm operation helm-operation-4zkvk (rancher-webhook) is over but its proxy sidecar keeps it Running 1/2, blocking appctl 'waiting for all pods to be ready'; release now: deployed (revision 1); remove: bash rancher-operation.sh --cleanup cmp-test2
+```
+
+**CubeCOS**：列出細節後刪除（先問；`--yes` 不問）
+
+```bash
+bash rancher-operation.sh --cleanup <cluster>
+```
+
+```text
+== helm operation cattle-system/helm-operation-4zkvk: helm exited 123 at 2026-11-26T06:39:20Z, proxy sidecar still running (Running 1/2)
+     release rancher-webhook (cattle-system) is now: deployed (revision 1)
+     last helm output:
+        Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress
+   DELETE the operation is over; only the sidecar keeps the pod alive (blocks appctl 'waiting for all pods to be ready').
+Delete 1 stuck helm-operation pod(s): cattle-system/helm-operation-4zkvk? [y/N] y
+Deleted. appctl's pod wait checks every 10s and goes on by itself.
+```
+
+- 只挑 `helm` 已結束超過 120 秒、`proxy` 還在跑的 `helm-operation-*`；剛結束、正在收尾的不動。
+- release 現況不是 `deployed` 時會加 `WARN`：刪 pod 不會修好 release，要到 Rancher Apps 重做。
+- 透過 `fleet-default/<cluster>-kubeconfig` 讀下游 cluster，不需要另外準備 kubeconfig。
+- 案例：2026-11-26 cube-r730 `cmp-test2`，刪掉 `helm-operation-4zkvk` 後 create 在 07:06 繼續；`rancher-webhook` 早已由另一個 operation 裝好。根本修正（appctl 應把 helm 已結束的 helm-operation pod 視為完成）已報給 RD。
+
+## 12. (CubeCOS → VM) 同一個指令 / 腳本在多台節點跑
+
+**CubeCOS**：全部問（選 cluster → 選 machine：數字或 `a` = 全部 → 輸入指令 → 確認）
+
+```bash
+bash rancher-operation.sh --node-cmd
+```
+
+```text
+  a  ALL machines that joined the cluster
+Machine number(s), space separated, or a: a
+Runs as the machine's ssh user: prefix sudo for root. Or: --bash SCRIPT [ARG...] (runs as root).
+Command: sudo ip r replace 10.32.0.0/16 via 192.168.1.254; ip r get 10.32.2.49 | head -1
+Cluster cmp-test2, 4 machine(s): cmp-test2-master-c6g6r-jzscc cmp-test2-worker-4kbcf-2hstv ...
+Run: sudo ip r replace 10.32.0.0/16 via 192.168.1.254; ip r get 10.32.2.49 | head -1
+Proceed? [y/N] y
+== cmp-test2-master-c6g6r-jzscc
+   10.32.2.49 via 192.168.1.254 dev enp1s0 src 192.168.1.116 uid 1000
+...
+4/4 ok
+```
+
+**CubeCOS → VM**：全部寫在命令列（不問、不確認，可放進腳本）
+
+```bash
+# 所有已加入 cluster 的節點
+bash rancher-operation.sh --node-cmd <cluster> all -- "sudo ip r replace 10.32.0.0/16 via 192.168.1.254"
+
+# 指定節點（依給的順序）
+bash rancher-operation.sh --node-cmd <cluster> <machine1> <machine2> -- "grep registry /etc/hosts"
+
+# 本機腳本以 root 執行（經 ssh stdin 給 sudo bash -s，節點上不留檔案）
+bash rancher-operation.sh --node-cmd <cluster> all --bash fix.sh <arg1> "<arg with spaces>"
+```
+
+- 連線方式與 `--connect` 相同（SSH 金鑰、FIP、`sshUser`），但不複製 `k8s-status.sh`。
+- 一台接一台；每台輸出縮排在 `== <machine>` 下，結尾 `N/M ok` + 失敗清單，有失敗 exit 1。某台失敗不影響其他台。
+- `-- COMMAND` 以 ssh 使用者（通常 `ubuntu`）執行，要 root 自己加 `sudo`；`--bash` 一律 root。
+- 在提示輸入 `--bash SCRIPT ARG...` 時參數只依空白切開（不認引號）；參數有空白請寫在命令列。
+- ⚠️ 在**沒設** `KUBECONFIG` 的 shell 跑（它讀本機 Rancher）；設了會報 `cluster fleet-default/<cluster> not found`。
+- 案例：2026-11-26 cube-r730 `cmp-test2`，4 台節點改 `/etc/hosts` 的 registry IP、補 `10.32.0.0/16` host route。
+
 ---
 
 ## 附：常用一行
@@ -485,11 +567,12 @@ bash rancher-operation.sh --verify used-images.txt
 | 要做什麼 | 在哪 | 指令 |
 |---|---|---|
 | 跟 cluster 建立進度 | CubeCOS | `bash rancher-operation.sh --watch <cluster>` |
-| 清掉用舊 template 的 MachineSet | CubeCOS | `bash rancher-operation.sh --cleanup <cluster>` |
+| 清掉用舊 template 的 MachineSet、卡住的 helm-operation pod | CubeCOS | `bash rancher-operation.sh --cleanup <cluster>` |
 | 看 / 改 mirror | CubeCOS | `bash rancher-operation.sh --repo <cluster> check \| update \| reset` |
 | image 在不在 registry | CubeCOS | `bash rancher-operation.sh --verify <list>` |
 | 下載 / 上傳 image | CubeCOS（下載：有網路的；上傳：站點） | `--download <list> [DIR]`（有網路主機）/ `--upload [DIR]`（離線 controller） |
 | 進 VM | CubeCOS | `bash rancher-operation.sh --connect <cluster> <machine>` |
+| 多台節點跑指令 / 腳本 | CubeCOS | `bash rancher-operation.sh --node-cmd <cluster> all -- "<cmd>"` / `--bash <script> [ARG...]` |
 | 節點狀態 | VM | `sudo bash k8s-status.sh [--watch]` |
 | 缺的 image / 用到的 image | VM | `sudo bash k8s-status.sh --missing` / `--used` |
 | 讓 pod 立刻重拉 | VM | `sudo bash k8s-status.sh --retry` |
