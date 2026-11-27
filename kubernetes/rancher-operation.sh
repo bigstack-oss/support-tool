@@ -4,7 +4,7 @@ set -uo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: bash rancher-operation.sh <--watch|--cleanup|--connect|--repo|--download|--upload|--verify> [args]
+Usage: bash rancher-operation.sh <--watch|--cleanup|--connect|--node-cmd|--repo|--download|--upload|--verify> [args]
 
   --watch [CLUSTER] [--once]
              Run on a controller. Follow provisioning like the UI log:
@@ -18,14 +18,19 @@ Usage: bash rancher-operation.sh <--watch|--cleanup|--connect|--repo|--download|
              machines with the old, broken settings), shows what changed
              (old -> new, secrets masked), and deletes the ones none of whose
              machines ever joined the cluster. Sets with joined machines are a
-             normal rolling update and are kept. Asks first; --yes skips it.
+             normal rolling update and are kept. Then lists Rancher
+             helm-operation-* pods in the cluster whose helm container ended
+             (>120s) while the proxy sidecar runs on (Running 1/2 forever;
+             blocks appctl "waiting for all pods to be ready"): exit code,
+             last helm output, the release's status now; deletes them.
+             Asks first; --yes skips it.
   --connect [CLUSTER] [MACHINE] [-- COMMAND...]
              Run on a controller. SSH into a VM of the cluster: no CLUSTER /
              MACHINE: list and ask for a number. Takes the machine's SSH key
              (secret <machine>-machine-state, as the UI "Download SSH Key") to
              KEY_DIR/<machine>-id_rsa (600, KEY_DIR private), the VM's floating IP (openstack
-             server list --all-projects --name <machine>; none: the IP Rancher
-             uses), sshUser/sshPort of its OpenstackMachine. Host key pinned on
+             server by its ID from machine-state; none: the IP Rancher
+             uses), sshUser/sshPort of its OpenstackMachine (format-checked). Host key pinned on
              first connect in KEY_DIR/<machine>-known_hosts. k8s-status.sh (next
              to this script, K8S_STATUS overrides) is copied to the VM's home
              first. COMMAND after --
@@ -33,6 +38,19 @@ Usage: bash rancher-operation.sh <--watch|--cleanup|--connect|--repo|--download|
                --connect runai runai-gpu-g4lj9-5j7fc -- sudo bash k8s-status.sh
              Not tee'd to a run log (interactive); one line per connection in
              LOG_DIR/rancher-node-connect.log.
+  --node-cmd [CLUSTER] [MACHINE...|all] -- COMMAND
+  --node-cmd [CLUSTER] [MACHINE...|all] --bash SCRIPT [ARG...]
+             Run on a controller. Run COMMAND (or a local SCRIPT as root:
+             sent over ssh stdin to "sudo bash -s", nothing left on the
+             node) on one, several or all machines
+             of the cluster (all = every machine that joined it), one after
+             another, same SSH key / IP / user as --connect (k8s-status.sh not
+             copied). Output indented under "== <machine>"; ends with "3/4 ok"
+             and the failed machines (exit 1 if any failed). Anything left out
+             is asked for: cluster list, machine list (numbers or a = all),
+             the command, then a confirmation.
+               --node-cmd cmp-test2 all -- "sudo ip r replace 10.32.0.0/16 via 192.168.1.254; ip r get 10.32.2.49 | head -1"
+               --node-cmd cmp-test2 all --bash fix-route.sh 10.32.0.0/16
   --repo [CLUSTER] [check|update|reset]
              Run on a controller. Registry mirrors of a downstream cluster
              (spec.rkeConfig.registries). No args: list RKE2/K3s clusters,
@@ -86,6 +104,7 @@ start_log() {
   { mkdir -p "$LOG_DIR" && touch "$LOG_DIR/.w" && rm -f "$LOG_DIR/.w"; } 2>/dev/null \
     || { echo "WARN: $LOG_DIR not writable; no log file" >&2; return 0; }
   LOG_FILE=$LOG_DIR/rancher-operation-$1-$(date +%Y%m%d-%H%M%S).log
+  ( umask 077; : >> "$LOG_FILE" )                     # logs hold cluster details: owner-only
   exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)   # stderr stays stderr
   echo "log: $LOG_FILE"
 }
@@ -108,7 +127,7 @@ LAST=
 
 # One poll. Returns 0 when Ready, 1 to keep waiting, 2 when the cluster is missing.
 step() {
-  local c=$1 cj ready msg lvl mj m phase fail sj cs pods p old new rdy joined
+  local c=$1 cj ready msg lvl mj m phase fail sj cs pods p old new rdy joined rel st
   cj=$(k -n "$NS" get clusters.provisioning.cattle.io "$c" -o json 2>/dev/null) || { say ERROR "cluster $NS/$c not found"; return 2; }
   ready=$(jq -r '.status.conditions[]? | select(.type=="Ready") | .status' <<< "$cj")
   # Same message the UI shows: first non-empty of Updated / Provisioned / Ready.
@@ -145,6 +164,11 @@ step() {
     if (( rdy + joined == 0 )); then say WARN "MachineSet $p still builds machines from old template $old (current $new); remove it: bash $0 --cleanup $c"
     else say INFO "MachineSet $p on old template $old is being rolled out to $new"; fi
   done < <(stale_sets "$c" 2>/dev/null)
+
+  while IFS=$'\t' read -r _ p _ _ rel _ st; do
+    [[ -n $p ]] && first "helmop:$p" || continue
+    say WARN "helm operation $p ($rel) is over but its proxy sidecar keeps it Running 1/2, blocking appctl 'waiting for all pods to be ready'; release now: $st; remove: bash $0 --cleanup $c"
+  done < <(stuck_ops "$c" 2>/dev/null)
 
   if [[ $ready == True ]]; then say DONE "cluster $c is Ready"; return 0; fi
   if [[ -n $msg && $msg != "$LAST" ]]; then
@@ -187,22 +211,93 @@ stale_sets() {
        ([$m.items[] | select(.metadata.labels["cluster.x-k8s.io/set-name"] == $set and .status.nodeRef != null)] | length)] | @tsv'
 }
 
-# "key: old -> new" for every template field that differs; credentials masked.
+# "key: old -> new" for every template field that differs; credentials, certificates and user data masked.
 template_diff() {
   local kind=$1 a b
   a=$(k -n "$NS" get "$kind" "$2" -o json) && b=$(k -n "$NS" get "$kind" "$3" -o json) || { echo "(cannot read templates)"; return 0; }
   jq -rn --argjson a "$a" --argjson b "$b" '($a.spec.template.spec // {}) as $o | ($b.spec.template.spec // {}) as $n
     | ([$o, $n] | map(keys) | add | unique)[] as $k | select($o[$k] != $n[$k])
-    | if ($k | test("password|secret|token"; "i")) then "\($k): *** -> ***"
+    | if ($k | test("password|secret|token|cred|cert|privatekey|userdata"; "i")) then "\($k): *** -> ***"
       else "\($k): \($o[$k] | tojson) -> \($n[$k] | tojson)" end'
 }
 
+# Ask before deleting; $2 == --yes skips. No terminal and no --yes: say how to re-run, delete nothing.
+confirm() {
+  local ans
+  [[ $2 == --yes ]] && return 0
+  [[ -t 0 ]] || { echo "Not a terminal: re-run with --yes to $1"; return 1; }
+  read -rp "${1^}? [y/N] " ans
+  [[ $ans == [yY]* ]] || { echo "Nothing deleted."; return 1; }
+}
+
+# kubectl against the downstream cluster, through Rancher (fleet-default/<cluster>-kubeconfig).
+down() {
+  local c=$1 kc rc; shift
+  kc=$(mktemp) || return 1   # holds a Rancher token: mktemp is 600, removed below
+  k -n "$NS" get secret "$c-kubeconfig" -o jsonpath='{.data.value}' 2>/dev/null | base64 -d > "$kc" 2>/dev/null
+  [[ -s $kc ]] || { rm -f "$kc"; return 1; }
+  k --kubeconfig "$kc" --request-timeout=10s "$@"; rc=$?
+  rm -f "$kc"; return "$rc"
+}
+
+# Rancher helm-operation pods whose helm container ended >120s ago while the proxy sidecar runs on:
+# Running 1/2 forever, which blocks appctl's "waiting for all pods to be ready" (60 min, then create fails).
+# Seen when two operations race on one release ("another operation ... is in progress").
+# TSV: namespace, pod, helm exit code, finished at, release, release namespace, release status now.
+stuck_ops() {
+  local c=$1 pods ops ns p ex fin rel rns st
+  pods=$(down "$c" get pods -A -o json 2>/dev/null) || return 1
+  ops=$(down "$c" get operations.catalog.cattle.io -A -o json 2>/dev/null) || ops='{"items":[]}'
+  while IFS=$'\t' read -r ns p ex fin; do
+    [[ -n $p ]] || continue
+    IFS=$'\t' read -r rel rns < <(jq -r --arg p "$p" '[.items[] | select(.status.podName == $p)][0].status // {}
+                                   | [.releaseName // "", .namespace // ""] | @tsv' <<< "$ops")
+    st=
+    [[ -n $rel ]] && st=$(down "$c" -n "$rns" get secrets -l "owner=helm,name=$rel" \
+      -o jsonpath='{range .items[*]}{.metadata.labels.version} {.metadata.labels.status}{"\n"}{end}' 2>/dev/null \
+      | sort -n | tail -1 | awk '{print $2 " (revision " $1 ")"}')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ns" "$p" "$ex" "$fin" "${rel:--}" "${rns:--}" "${st:-not found}"
+  done < <(jq -r '.items[] | select((.metadata.name | startswith("helm-operation-")) and .status.phase == "Running")
+      | (.status.containerStatuses // []) as $cs
+      | ([$cs[] | select(.name == "helm") | .state.terminated][0]) as $t
+      | select($t != null and $t.finishedAt != null and (now - ($t.finishedAt | fromdateiso8601)) > 120
+               and any($cs[]; .name != "helm" and .state.running != null))
+      | [.metadata.namespace, .metadata.name, ($t.exitCode | tostring), $t.finishedAt] | @tsv' <<< "$pods")
+}
+
+cleanup_ops() {
+  local c=$1 yes=$2 rows=() del=() l ns p ex fin rel rns st
+  while IFS= read -r l; do rows+=("$l"); done < <(stuck_ops "$c")
+  (( ${#rows[@]} )) || { echo "No stuck helm-operation pods in $c."; return 0; }
+  for l in "${rows[@]}"; do
+    IFS=$'\t' read -r ns p ex fin rel rns st <<< "$l"
+    echo "== helm operation $ns/$p: helm exited $ex at $fin, proxy sidecar still running (Running 1/2)"
+    echo "     release $rel ($rns) is now: $st"
+    echo "     last helm output:"
+    down "$c" -n "$ns" logs "$p" -c helm --tail=3 2>/dev/null | sed 's/^/        /'
+    echo "   DELETE the operation is over; only the sidecar keeps the pod alive (blocks appctl 'waiting for all pods to be ready')."
+    [[ $st == deployed* ]] || echo "   WARN   release $rel is not deployed: deleting the pod does not fix it; redo it in Rancher Apps after."
+    del+=("$ns/$p")
+  done
+  confirm "delete ${#del[@]} stuck helm-operation pod(s): ${del[*]}" "$yes" || return 0
+  for l in "${del[@]}"; do
+    down "$c" -n "${l%%/*}" delete pod "${l#*/}" --wait=false || die "delete $l failed"
+  done
+  echo "Deleted. appctl's pod wait checks every 10s and goes on by itself."
+}
+
 cleanup_main() {
-  local c=${1:-} yes=${2:-} rows=() del=() l set dep kind old new rdy joined ans
+  local c=${1:-} yes=${2:-}
   [[ $c == --yes ]] && { yes=$c; c=; }
   need jq
   if [[ -z $c ]]; then pick_cluster; c=$PICKED; fi
   cluster_json "$c" >/dev/null
+  cleanup_sets "$c" "$yes"
+  cleanup_ops "$c" "$yes"
+}
+
+cleanup_sets() {
+  local c=$1 yes=$2 rows=() del=() l set dep kind old new rdy joined
   while IFS= read -r l; do rows+=("$l"); done < <(stale_sets "$c")
   (( ${#rows[@]} )) || { echo "No stale MachineSets in $c: every pool builds from its current template."; return 0; }
   for l in "${rows[@]}"; do
@@ -217,11 +312,7 @@ cleanup_main() {
     fi
   done
   (( ${#del[@]} )) || return 0
-  if [[ $yes != --yes ]]; then
-    [[ -t 0 ]] || { echo "Not a terminal: re-run with --yes to delete ${del[*]}"; return 0; }
-    read -rp "Delete ${#del[@]} stale MachineSet(s): ${del[*]}? [y/N] " ans
-    [[ $ans == [yY]* ]] || { echo "Nothing deleted."; return 0; }
-  fi
+  confirm "delete ${#del[@]} stale MachineSet(s): ${del[*]}" "$yes" || return 0
   for set in "${del[@]}"; do
     k -n "$NS" delete machinesets.cluster.x-k8s.io "$set" --wait=false || die "delete $set failed"
   done
@@ -232,8 +323,9 @@ cleanup_main() {
 KEY_DIR=${KEY_DIR:-/tmp/rancher-keys-$(id -u)}   # private per user: /tmp itself is shared
 
 # Print the machine table of a cluster, read a number, set PICKED.
+# $2 == multi: read several numbers or a (= every machine that joined), set PICKS.
 pick_machine() {
-  local rows=() l i n ph nd
+  local rows=() l i n ph nd ans
   while IFS= read -r l; do rows+=("$l"); done < <(k -n "$NS" get machines.cluster.x-k8s.io -l "cluster.x-k8s.io/cluster-name=$1" -o json \
     | jq -r '.items[] | [.metadata.name, (.status.phase // "-"), (.status.nodeRef.name // "no node")] | @tsv')
   (( ${#rows[@]} )) || die "no machines in cluster $1"
@@ -242,6 +334,21 @@ pick_machine() {
     IFS=$'\t' read -r n ph nd <<< "${rows[$i]}"
     printf '%3d  %-45s %-14s %s\n' $((i + 1)) "$n" "$ph" "$nd"
   done
+  if [[ ${2:-} == multi ]]; then
+    printf '%3s  %s\n' a 'ALL machines that joined the cluster'
+    read -rp "Machine number(s), space separated, or a: " ans
+    PICKS=()
+    if [[ $ans == a || $ans == all ]]; then
+      for l in "${rows[@]}"; do [[ ${l##*$'\t'} == "no node" ]] || PICKS+=("${l%%$'\t'*}"); done
+    else
+      for i in $ans; do
+        [[ $i =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#rows[@]} )) || die "invalid choice: $i"
+        PICKS+=("${rows[$((i - 1))]%%$'\t'*}")
+      done
+    fi
+    (( ${#PICKS[@]} )) || die "no machine chosen"
+    return
+  fi
   read -rp "Machine number: " i
   [[ $i =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#rows[@]} )) || die "invalid choice: $i"
   PICKED=${rows[$((i - 1))]%%$'\t'*}
@@ -253,20 +360,25 @@ machine_file() {
     | tar xzO --wildcards "*/machines/$1/$2" 2>/dev/null
 }
 
-# Floating IP of the OpenStack server named like the machine (admin, all projects).
+# Floating IP of the machine's OpenStack server. $1 = server ID (Driver.MachineId), $2 = machine name,
+# $3 = project (Driver.TenantId). By ID when known; a name search must match exactly one server.
 floating_ip() {
-  local id p
+  local id=${1:-} p ids n
   if [[ -z ${OS_AUTH_URL:-} && -r ${OPENRC:-/etc/admin-openrc.sh} ]]; then source "${OPENRC:-/etc/admin-openrc.sh}"; fi
   command -v openstack >/dev/null || return 0
-  id=$(openstack server list --all-projects --name "^$1\$" -f value -c ID 2>/dev/null | head -1)
-  [[ -n $id ]] || return 0
+  if [[ -z $id ]]; then
+    ids=$(openstack server list --all-projects ${3:+--project "$3"} --name "^$2\$" -f value -c ID 2>/dev/null)
+    n=$(grep -c . <<< "$ids")
+    if (( n != 1 )); then echo "WARN: $n OpenStack servers named $2${3:+ in project $3}; not guessing the floating IP" >&2; return 0; fi
+    id=$ids
+  fi
   for p in $(openstack port list --server "$id" -f value -c ID 2>/dev/null); do
     openstack floating ip list --port "$p" -f value -c "Floating IP Address" 2>/dev/null
   done | head -1
 }
 
 connect_main() {
-  local pos=() c m key tmp cfg ref user port ip st
+  local pos=() c m key tmp cfg ref user port ip st dest
   while (( $# )) && [[ $1 != -- ]]; do pos+=("$1"); shift; done   # CLUSTER MACHINE
   [[ ${1:-} == -- ]] && shift                                      # the rest is the remote command
   c=${pos[0]:-}; m=${pos[1]:-}
@@ -293,24 +405,82 @@ connect_main() {
   [[ -n $port ]] || port=$(jq -r '.Driver.SSHPort // empty' <<< "$cfg" 2>/dev/null)
   user=${user:-root}; port=${port:-22}
 
-  ip=$(floating_ip "$m")
+  ip=$(floating_ip "$(jq -r '.Driver.MachineId // empty' <<< "$cfg" 2>/dev/null)" "$m" \
+    "$(jq -r '.Driver.TenantId // empty' <<< "$cfg" 2>/dev/null)")
   if [[ -z $ip ]]; then
     ip=$(jq -r '.Driver.IPAddress // empty' <<< "$cfg" 2>/dev/null)
     [[ -n $ip ]] && echo "No floating IP found for $m; using the IP Rancher uses: $ip" >&2
   fi
   [[ -n $ip ]] || die "no IP for $m (no floating IP, no driver IPAddress)"
+  # These come from cluster objects: never let them turn into ssh options.
+  [[ $user =~ ^[a-z_][a-z0-9_.-]*$ ]] || die "refusing sshUser '$user' for $m"
+  [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "refusing sshPort '$port' for $m"
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $ip =~ ^[0-9a-fA-F:]+:[0-9a-fA-F:]*$ ]] || die "refusing IP '$ip' for $m"
+  dest=$ip; [[ $ip == *:* ]] && dest="[$ip]"         # IPv6 needs brackets in scp's host:path
 
   echo "$m: $user@$ip:$port  key $key"
   # Ship the node check so it is ready on the VM (sudo bash k8s-status.sh); a failed copy does not block the login.
   st=${K8S_STATUS:-$(dirname "${BASH_SOURCE[0]}")/k8s-status.sh}
-  if [[ ! -r $st ]]; then echo "WARN: $st not found; not copied to the VM" >&2
-  elif scp -q -i "$key" -P "$port" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" \
-      "$st" "$user@$ip:k8s-status.sh"; then echo "copied k8s-status.sh to ~$user/ (run: sudo bash k8s-status.sh)"
+  if [[ -n ${NODE_CMD:-} ]]; then :                  # --node-cmd: one command per node, no copy
+  elif [[ ! -r $st ]]; then echo "WARN: $st not found; not copied to the VM" >&2
+  elif scp -q -i "$key" -P "$port" -o User="$user" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" \
+      -- "$st" "$dest:k8s-status.sh"; then echo "copied k8s-status.sh to ~$user/ (run: sudo bash k8s-status.sh)"
   else echo "WARN: scp of $st to $user@$ip failed; connecting anyway" >&2; fi
   { mkdir -p "$LOG_DIR" && echo "$(date '+%F %T') $(id -un) $c $m $user@$ip:$port $*" >> "$LOG_DIR/rancher-node-connect.log"; } 2>/dev/null
   # Host key: trusted on first use, pinned per machine. A rebuilt VM is a new machine name (new file), so only a key
   # change on the same VM fails, as it should.
-  exec ssh -i "$key" -p "$port" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" "$user@$ip" "$@"
+  exec ssh -i "$key" -p "$port" -l "$user" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KEY_DIR/$m-known_hosts" -- "$ip" "$@"
+}
+
+# ============================================================ --node-cmd
+node_cmd_main() {
+  local pos=() ms=() failed=() c m rc ok=0 script=/dev/null line ans asked=
+  local usage="Usage: bash $0 --node-cmd [CLUSTER] [MACHINE...|all] [-- COMMAND | --bash SCRIPT [ARG...]]"
+  while (( $# )) && [[ $1 != -- && $1 != --bash ]]; do pos+=("$1"); shift; done   # CLUSTER [MACHINE...|all]
+  need jq
+  # Anything left out is asked for: cluster, machines, command. Not a terminal: all must be given.
+  [[ -t 0 ]] || { [[ -n ${pos[0]:-} && -n ${pos[1]:-} ]] && (( $# )) || die "$usage"; }
+  c=${pos[0]:-}
+  if [[ -z $c ]]; then pick_cluster; c=$PICKED; fi
+  cluster_json "$c" >/dev/null
+  ms=("${pos[@]:1}")
+  if [[ ${ms[*]} == all ]]; then   # every machine that joined the cluster
+    mapfile -t ms < <(k -n "$NS" get machines.cluster.x-k8s.io -l "cluster.x-k8s.io/cluster-name=$c" -o json \
+      | jq -r '.items[] | select(.status.nodeRef != null) | .metadata.name')
+    (( ${#ms[@]} )) || die "no machines in $c have joined the cluster"
+  elif (( ! ${#ms[@]} )); then pick_machine "$c" multi; ms=("${PICKS[@]}"); fi
+  if (( ! $# )); then
+    echo "Runs as the machine's ssh user: prefix sudo for root. Or: --bash SCRIPT [ARG...] (runs as root)."
+    read -rp "Command: " line
+    [[ -n ${line// } ]] || die "no command given"
+    if [[ $line == --bash\ * ]]; then read -ra pos <<< "$line"; set -- "${pos[@]}"; else set -- -- "$line"; fi
+    asked=1
+  fi
+  if [[ ${1:-} == --bash ]]; then
+    script=${2:-}; [[ -f $script && -r $script ]] || die "--bash needs a readable local script: '${script}'"
+    shift 2
+    # The script goes over ssh stdin; its arguments are quoted for the remote shell.
+    set -- "sudo bash -s --$( (( $# )) && printf ' %q' "$@")"
+  else
+    [[ ${1:-} == -- ]] && shift
+  fi
+  (( $# )) || die "$usage"
+  if [[ -n $asked ]]; then   # typed at the prompt: show what will run where, then ask
+    echo "Cluster $c, ${#ms[@]} machine(s): ${ms[*]}"
+    echo "Run: $*"
+    [[ $script == /dev/null ]] || echo "Script: $script"
+    read -rp "Proceed? [y/N] " ans
+    [[ $ans == [yY]* ]] || { echo "Nothing run."; return 0; }
+  fi
+  for m in "${ms[@]}"; do
+    echo "== $m"
+    # subshell: connect_main's exec ssh (or die) ends only this node's run
+    ( NODE_CMD=1 connect_main "$c" "$m" -- "$@" ) < "$script" 2>&1 | sed 's/^/   /'
+    rc=${PIPESTATUS[0]}
+    if (( rc == 0 )); then ok=$((ok + 1)); else failed+=("$m (rc $rc)"); fi
+  done
+  echo "$ok/${#ms[@]} ok"
+  (( ${#failed[@]} == 0 )) || { printf 'FAILED: %s\n' "${failed[@]}"; return 1; }
 }
 
 # ============================================================ --repo
@@ -536,11 +706,12 @@ upload() {
 main() {
   local op=${1:-}; shift || true
   local what=${1:-}; what=${what##*/}; [[ -z $what || $what == -* ]] && what= || what=-$what   # cluster or list name
-  case $op in --watch|--cleanup|--repo|--download|--upload|--verify) start_log "${op#--}$what" ;; esac
+  case $op in --watch|--cleanup|--node-cmd|--repo|--download|--upload|--verify) start_log "${op#--}$what" ;; esac
   case $op in
     --watch) watch_main "$@" ;;
     --cleanup) cleanup_main "$@" ;;
     --connect) connect_main "$@" ;;   # no start_log: an interactive ssh must not go through tee
+    --node-cmd) node_cmd_main "$@" ;;
     --repo) repo_main "$@" ;;
     --download) [[ -n ${1:-} ]] || die "Usage: bash $0 --download LIST [DIR]"; download "$1" "${2:-offline-images}" ;;
     --upload) upload "${1:-offline-images}" ;;
